@@ -1,0 +1,9 @@
+# awg-mesh-tui config: copy to ~/.config/awg-mesh-tui/config.toml and edit.
+# `ssh_alias` is resolved by your ssh config; keys come from the ssh agent.
+active_server = "prod"
+
+[servers.prod]
+ssh_alias = "my-vps"          # Host from ~/.ssh/config (or any ssh target)
+cli_path = "awg-mesh"          # awg-mesh CLI on the server (bootstrap if missing)
+container = "amnezia-mesh-awg" # awg container of an initialized stack
+login_shell = "sh"             # wraps remote commands; "zsh" needed on macOS stands
