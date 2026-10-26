@@ -103,13 +103,41 @@ impl MockTransport {
     }
 }
 
-/// Canned transport for `--mock`: a healthy server with docker and the CLI.
+/// Canned transport for `--mock`: a healthy server with docker, the CLI
+/// (already bootstrapped), one AmneziaWG migration candidate and one
+/// noise container.
 pub fn mock_canned() -> Transport {
     Transport::Mock(MockTransport {
         responses: vec![
             ("command -v docker".into(), "/usr/bin/docker\n".into()),
             ("docker version --format".into(), "29.5.2\n".into()),
             ("awg-mesh --version".into(), "awg-mesh 0.2.0\n".into()),
+            ("command -v git".into(), "/usr/bin/git\n".into()),
+            ("test -x".into(), "HAVE\n".into()),
+            ("pull --ff-only".into(), "Already up to date.\n".into()),
+            (
+                "docker ps -a".into(),
+                concat!(
+                    r#"{"Command":"x","ID":"9d041a65c06e","Image":"amneziavpn/amneziawg-go:latest","Names":"amnezia-legacy-test","State":"running","Status":"Up 3 minutes"}"#,
+                    "\n",
+                    r#"{"Command":"x","ID":"e867f97f7085","Image":"nginx:alpine","Names":"web","State":"running","Status":"Up 2 hours"}"#,
+                    "\n",
+                )
+                .into(),
+            ),
+            (
+                "adopt --inspect".into(),
+                r#"{"ok":true,"inspect":{
+                    "source":"container 'amnezia-legacy-test'",
+                    "image":"amneziavpn/amneziawg-go:latest",
+                    "server_pub":"PUB","subnet":"10.8.1.0/24","mtu":"1280",
+                    "listen_port":"51820","server_keepalive":"25",
+                    "obfuscation_params":20,
+                    "peers":[{"name":"test-phone","ip":"10.8.1.2",
+                              "created":"2026-09-14T08:30:00Z"}],
+                    "warnings":["peer xyz has no usable name comment"]}}"#
+                    .into(),
+            ),
         ],
     })
 }

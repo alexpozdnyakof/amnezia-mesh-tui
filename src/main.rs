@@ -1,5 +1,8 @@
 mod app;
+mod bootstrap;
 mod config;
+mod docker;
+mod inspect;
 mod probe;
 mod transport;
 mod ui;
@@ -9,11 +12,12 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::Mutex;
 
-use app::App;
+use app::{App, Job, Screen};
 use config::{Config, ServerConfig};
 use transport::Transport;
 
@@ -31,6 +35,14 @@ struct Args {
     /// Run the preflight probe once, print the result, exit (no TUI).
     #[arg(long)]
     probe_once: bool,
+
+    /// Probe, list docker containers once, print, exit (no TUI).
+    #[arg(long)]
+    discover_once: bool,
+
+    /// Run `adopt --inspect` on a container once, print, exit (no TUI).
+    #[arg(long, value_name = "CONTAINER")]
+    inspect_once: Option<String>,
 
     /// Use a canned in-process transport (TUI development without a server).
     #[arg(long, hide = true)]
@@ -71,8 +83,14 @@ async fn main() -> Result<()> {
     if args.probe_once {
         return probe_once(&name, &server, &transport).await;
     }
+    if args.discover_once {
+        return discover_once(&name, &server, &transport).await;
+    }
+    if let Some(container) = &args.inspect_once {
+        return inspect_once(container, &server, &transport).await;
+    }
 
-    run_tui(&name, server, transport).await
+    run_tui(&name, server, cfg, cfg_path, transport).await
 }
 
 async fn probe_once(name: &str, server: &ServerConfig, transport: &Transport) -> Result<()> {
@@ -92,8 +110,79 @@ async fn probe_once(name: &str, server: &ServerConfig, transport: &Transport) ->
     Ok(())
 }
 
-async fn run_tui(name: &str, server: ServerConfig, transport: Transport) -> Result<()> {
-    let app = Arc::new(Mutex::new(App::new(name.to_string(), server)));
+async fn discover_once(name: &str, server: &ServerConfig, transport: &Transport) -> Result<()> {
+    let probe = probe::probe(transport, server).await;
+    let docker = match probe.docker_path {
+        Some(d) => d,
+        None => bail!("docker not found on server '{name}'"),
+    };
+    let containers = docker::discover(transport, &docker)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    println!("server: {name} — {} container(s)", containers.len());
+    for c in &containers {
+        println!(
+            "{} {:<24} {:<40} {}{}",
+            if c.candidate { "◆" } else { "·" },
+            c.name,
+            c.image,
+            c.status,
+            if c.candidate {
+                "  [migration candidate]"
+            } else {
+                ""
+            },
+        );
+    }
+    Ok(())
+}
+
+async fn inspect_once(container: &str, server: &ServerConfig, transport: &Transport) -> Result<()> {
+    match inspect::inspect(transport, server, container).await {
+        Ok(s) => {
+            println!("container: {container}");
+            println!("source: {}", s.source);
+            println!("image: {}", s.image);
+            println!(
+                "subnet: {}  mtu: {}  listen: {}  keepalive: {}  obfuscation params: {}",
+                s.subnet, s.mtu, s.listen_port, s.server_keepalive, s.obfuscation_params
+            );
+            println!("server pubkey: {}", s.server_pub);
+            println!("peers ({}):", s.peers.len());
+            for p in &s.peers {
+                println!(
+                    "  {}  {:<18}  {}",
+                    p.name,
+                    p.ip,
+                    p.created.as_deref().unwrap_or("—")
+                );
+            }
+            for w in &s.warnings {
+                println!("warning: {w}");
+            }
+            Ok(())
+        }
+        Err(inspect::InspectError::CliMissing) => bail!(
+            "awg-mesh CLI not found on the server (cli_path: {}) — bootstrap it first",
+            server.cli_path
+        ),
+        Err(e) => Err(anyhow::Error::new(e)),
+    }
+}
+
+async fn run_tui(
+    name: &str,
+    server: ServerConfig,
+    cfg: Config,
+    cfg_path: PathBuf,
+    transport: Transport,
+) -> Result<()> {
+    let app = Arc::new(Mutex::new(App::new(
+        name.to_string(),
+        server,
+        cfg,
+        cfg_path,
+    )));
 
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -114,7 +203,7 @@ async fn run_tui(name: &str, server: ServerConfig, transport: Transport) -> Resu
 }
 
 enum Event {
-    Key(crossterm::event::KeyEvent),
+    Key(KeyEvent),
 }
 
 async fn event_loop(
@@ -147,17 +236,71 @@ async fn event_loop(
         }
         tokio::select! {
             _ = tick.tick() => {
-                App::maybe_spawn_probe(&app, transport.clone());
+                App::pump(&app, &transport).await;
             }
             Some(event) = rx.recv() => match event {
-                Event::Key(key) => match key.code {
-                    crossterm::event::KeyCode::Char('q') => return Ok(()),
-                    crossterm::event::KeyCode::Char('r') => {
-                        app.lock().await.request_probe();
+                Event::Key(key) => {
+                    if handle_key(&app, key).await {
+                        return Ok(());
                     }
-                    _ => {}
-                },
+                }
             },
         }
     }
+}
+
+/// Returns true when the user asked to quit.
+async fn handle_key(app: &Arc<Mutex<App>>, key: KeyEvent) -> bool {
+    let mut a = app.lock().await;
+    if key.code == KeyCode::Char('q') {
+        return true;
+    }
+    match a.screen {
+        Screen::Preflight => match key.code {
+            KeyCode::Char('r') => a.request(Job::Probe),
+            KeyCode::Char('d') => a.request(Job::Discover),
+            KeyCode::Char('b') => {
+                if a.bootstrap.confirm_pending {
+                    a.bootstrap.confirm_pending = false;
+                    a.request(Job::Bootstrap);
+                } else {
+                    a.bootstrap.confirm_pending = true;
+                }
+            }
+            KeyCode::Esc => a.bootstrap.confirm_pending = false,
+            _ => {}
+        },
+        Screen::Discovery => {
+            let len = a.discovery.containers.len();
+            match key.code {
+                KeyCode::Up => {
+                    a.discovery.selected = a.discovery.selected.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    if len > 0 {
+                        a.discovery.selected = (a.discovery.selected + 1).min(len - 1);
+                    }
+                }
+                KeyCode::Enter => {
+                    let container = a
+                        .discovery
+                        .containers
+                        .get(a.discovery.selected)
+                        .map(|c| c.name.clone());
+                    if let Some(name) = container {
+                        a.request(Job::Inspect(name));
+                    }
+                }
+                KeyCode::Char('d') => a.request(Job::Discover),
+                KeyCode::Esc => a.screen = Screen::Preflight,
+                _ => {}
+            }
+        }
+        Screen::Inspect => {
+            if key.code == KeyCode::Esc {
+                a.screen = Screen::Discovery;
+            }
+        }
+    }
+    false
 }
