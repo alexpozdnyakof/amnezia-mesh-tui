@@ -51,9 +51,30 @@ pub fn parse_ps(stdout: &str) -> Vec<ContainerInfo> {
         .collect()
 }
 
+pub const COMPOSE_PROJECT: &str = "amnezia-mesh";
+
 pub async fn discover(transport: &Transport, docker: &str) -> Result<Vec<ContainerInfo>, String> {
     let out = transport
         .exec(&format!("{docker} ps -a --format '{{{{json .}}}}'"))
+        .await
+        .map_err(|e| e.to_string())?;
+    if !out.ok() {
+        return Err(format!("docker ps failed: {}", out.stderr.trim()));
+    }
+    Ok(parse_ps(&out.stdout))
+}
+
+/// Containers of the initialized amnezia-mesh stack (compose project label —
+/// no compose plugin needed on the server).
+pub async fn stack_services(
+    transport: &Transport,
+    docker: &str,
+) -> Result<Vec<ContainerInfo>, String> {
+    let out = transport
+        .exec(&format!(
+            "{docker} ps -a --filter label=com.docker.compose.project={COMPOSE_PROJECT} \
+             --format '{{{{json .}}}}'"
+        ))
         .await
         .map_err(|e| e.to_string())?;
     if !out.ok() {

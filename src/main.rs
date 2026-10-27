@@ -2,8 +2,11 @@ mod app;
 mod bootstrap;
 mod config;
 mod docker;
+mod doctor;
 mod inspect;
+mod peers;
 mod probe;
+mod show;
 mod transport;
 mod ui;
 
@@ -43,6 +46,10 @@ struct Args {
     /// Run `adopt --inspect` on a container once, print, exit (no TUI).
     #[arg(long, value_name = "CONTAINER")]
     inspect_once: Option<String>,
+
+    /// Print the live peer table once (awg show), exit (no TUI).
+    #[arg(long)]
+    peers_once: bool,
 
     /// Use a canned in-process transport (TUI development without a server).
     #[arg(long, hide = true)]
@@ -88,6 +95,9 @@ async fn main() -> Result<()> {
     }
     if let Some(container) = &args.inspect_once {
         return inspect_once(container, &server, &transport).await;
+    }
+    if args.peers_once {
+        return peers_once(&server, &transport).await;
     }
 
     run_tui(&name, server, cfg, cfg_path, transport).await
@@ -168,6 +178,52 @@ async fn inspect_once(container: &str, server: &ServerConfig, transport: &Transp
         ),
         Err(e) => Err(anyhow::Error::new(e)),
     }
+}
+
+async fn peers_once(server: &ServerConfig, transport: &Transport) -> Result<()> {
+    let probe = probe::probe(transport, server).await;
+    let docker = match probe.docker_path {
+        Some(d) => d,
+        None => bail!("docker not found on server"),
+    };
+    let container = &server.container;
+    let out = transport
+        .exec(&format!("{docker} exec {container} awg show"))
+        .await
+        .map_err(anyhow::Error::msg)?;
+    if !out.ok() {
+        bail!("awg show failed in '{container}': {}", out.stderr.trim());
+    }
+    let info = show::parse_show(&out.stdout).map_err(anyhow::Error::msg)?;
+    let names_pub = peers::fetch_names(transport, &server.cli_path).await;
+    let mut samples = std::collections::HashMap::new();
+    let rows = peers::resolve_peers(
+        &info.peers,
+        &names_pub,
+        &std::collections::HashMap::new(),
+        &mut samples,
+        std::time::Instant::now(),
+    );
+    println!("container: {container} ({} peers)", rows.len());
+    println!(
+        "{:<24} {:<16} {:<8} {:<12} {:<24} {:>12} {:>12}",
+        "NAME", "IP", "STATUS", "HANDSHAKE", "ENDPOINT", "RX", "TX"
+    );
+    for p in &rows {
+        println!(
+            "{:<24} {:<16} {:<8} {:<12} {:<24} {:>12} {:>12}",
+            p.name,
+            p.ip,
+            p.status.as_str(),
+            p.handshake
+                .map(peers::format_age)
+                .unwrap_or_else(|| "never".into()),
+            p.endpoint.clone().unwrap_or_else(|| "—".into()),
+            peers::format_rate(p.rx_rate),
+            peers::format_rate(p.tx_rate),
+        );
+    }
+    Ok(())
 }
 
 async fn run_tui(
@@ -267,6 +323,7 @@ async fn handle_key(app: &Arc<Mutex<App>>, key: KeyEvent) -> bool {
                     a.bootstrap.confirm_pending = true;
                 }
             }
+            KeyCode::Char('g') => a.enter_dashboard(),
             KeyCode::Esc => a.bootstrap.confirm_pending = false,
             _ => {}
         },
@@ -299,6 +356,11 @@ async fn handle_key(app: &Arc<Mutex<App>>, key: KeyEvent) -> bool {
         Screen::Inspect => {
             if key.code == KeyCode::Esc {
                 a.screen = Screen::Discovery;
+            }
+        }
+        Screen::Dashboard => {
+            if key.code == KeyCode::Esc {
+                a.screen = Screen::Preflight;
             }
         }
     }

@@ -1,14 +1,23 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
 use crate::bootstrap::bootstrap;
 use crate::config::{Config, ServerConfig};
-use crate::docker::{discover, ContainerInfo};
+use crate::docker::{discover, stack_services, ContainerInfo};
+use crate::doctor::{doctor, DoctorReport};
 use crate::inspect::{inspect, InspectSummary};
+use crate::peers::{fetch_names, resolve_peers, PeerSample, ResolvedPeer};
 use crate::probe::{probe, ProbeResult};
+use crate::show::parse_show;
 use crate::transport::Transport;
+
+const PEERS_INTERVAL: Duration = Duration::from_secs(3);
+const SERVICES_INTERVAL: Duration = Duration::from_secs(10);
+const DOCTOR_INTERVAL: Duration = Duration::from_secs(45);
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Job {
@@ -16,6 +25,9 @@ pub enum Job {
     Discover,
     Inspect(String),
     Bootstrap,
+    PollPeers,
+    Services,
+    Doctor,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -23,6 +35,7 @@ pub enum Screen {
     Preflight,
     Discovery,
     Inspect,
+    Dashboard,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -56,6 +69,21 @@ pub struct BootstrapState {
     pub error: Option<String>,
 }
 
+/// Live dashboard state (M2): peers poll, stack services, doctor.
+#[derive(Debug, Default)]
+pub struct DashboardState {
+    pub peers: Vec<ResolvedPeer>,
+    pub samples: HashMap<String, PeerSample>,
+    pub peers_error: Option<String>,
+    pub services: Vec<ContainerInfo>,
+    pub services_error: Option<String>,
+    pub doctor: Option<DoctorReport>,
+    pub doctor_error: Option<String>,
+    pub last_peers: Option<Instant>,
+    pub last_services: Option<Instant>,
+    pub last_doctor: Option<Instant>,
+}
+
 #[derive(Debug)]
 pub struct App {
     pub server_name: String,
@@ -67,6 +95,7 @@ pub struct App {
     pub discovery: DiscoveryState,
     pub inspect: InspectState,
     pub bootstrap: BootstrapState,
+    pub dashboard: DashboardState,
     queue: Vec<Job>,
     running: Option<Job>,
 }
@@ -88,6 +117,7 @@ impl App {
             discovery: DiscoveryState::default(),
             inspect: InspectState::default(),
             bootstrap: BootstrapState::default(),
+            dashboard: DashboardState::default(),
             queue: vec![Job::Probe],
             running: None,
         }
@@ -110,10 +140,43 @@ impl App {
         }
     }
 
+    /// Switch to the dashboard and fire all polls immediately.
+    pub fn enter_dashboard(&mut self) {
+        self.screen = Screen::Dashboard;
+        self.dashboard.last_peers = None;
+        self.dashboard.last_services = None;
+        self.dashboard.last_doctor = None;
+        self.request(Job::PollPeers);
+        self.request(Job::Services);
+        self.request(Job::Doctor);
+    }
+
+    fn due(at: Option<Instant>, interval: Duration) -> bool {
+        at.is_none_or(|t| t.elapsed() >= interval)
+    }
+
+    /// Queue periodic dashboard polls when their interval has elapsed.
+    /// Called from `pump` on every tick; `request` dedups.
+    fn schedule_periodics(&mut self) {
+        if self.screen != Screen::Dashboard || self.running.is_some() {
+            return;
+        }
+        if Self::due(self.dashboard.last_peers, PEERS_INTERVAL) {
+            self.request(Job::PollPeers);
+        }
+        if Self::due(self.dashboard.last_services, SERVICES_INTERVAL) {
+            self.request(Job::Services);
+        }
+        if Self::due(self.dashboard.last_doctor, DOCTOR_INTERVAL) {
+            self.request(Job::Doctor);
+        }
+    }
+
     /// Start the next queued job. Cheap to call on every tick.
     pub async fn pump(app: &Arc<Mutex<App>>, transport: &Transport) {
         let job = {
             let mut a = app.lock().await;
+            a.schedule_periodics();
             if a.running.is_some() {
                 return;
             }
@@ -208,6 +271,92 @@ impl App {
                         Err(e) => a.bootstrap.error = Some(e),
                     }
                 }
+                Job::PollPeers => {
+                    let (docker, container, cli) = {
+                        let a = handle.lock().await;
+                        (
+                            a.probe.as_ref().and_then(|p| p.docker_path.clone()),
+                            a.server.container.clone(),
+                            a.server.cli_path.clone(),
+                        )
+                    };
+                    let outcome = async {
+                        let docker = docker.ok_or("run the probe first (r)")?;
+                        let out = transport
+                            .exec(&format!("{docker} exec {container} awg show"))
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        if !out.ok() {
+                            let msg = out.stderr.trim();
+                            return Err(if msg.is_empty() {
+                                format!("awg show failed in '{container}'")
+                            } else {
+                                format!("awg show failed in '{container}': {msg}")
+                            });
+                        }
+                        let info = parse_show(&out.stdout)?;
+                        let names_pub = fetch_names(&transport, &cli).await;
+                        Ok((info, names_pub))
+                    }
+                    .await;
+                    let mut a = handle.lock().await;
+                    a.dashboard.last_peers = Some(Instant::now());
+                    match outcome {
+                        Ok((info, names_pub)) => {
+                            let names_ip: HashMap<String, String> = a
+                                .inspect
+                                .summary
+                                .as_ref()
+                                .map(|s| {
+                                    s.peers
+                                        .iter()
+                                        .map(|p| (p.ip.clone(), p.name.clone()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            a.dashboard.peers = resolve_peers(
+                                &info.peers,
+                                &names_pub,
+                                &names_ip,
+                                &mut a.dashboard.samples,
+                                Instant::now(),
+                            );
+                            a.dashboard.peers_error = None;
+                        }
+                        Err(e) => a.dashboard.peers_error = Some(e),
+                    }
+                }
+                Job::Services => {
+                    let docker = {
+                        let a = handle.lock().await;
+                        a.probe.as_ref().and_then(|p| p.docker_path.clone())
+                    };
+                    let outcome = match docker {
+                        None => Err("run the probe first (r)".into()),
+                        Some(d) => stack_services(&transport, &d).await,
+                    };
+                    let mut a = handle.lock().await;
+                    a.dashboard.last_services = Some(Instant::now());
+                    match outcome {
+                        Ok(list) => {
+                            a.dashboard.services = list;
+                            a.dashboard.services_error = None;
+                        }
+                        Err(e) => a.dashboard.services_error = Some(e),
+                    }
+                }
+                Job::Doctor => {
+                    let outcome = doctor(&transport, &server).await;
+                    let mut a = handle.lock().await;
+                    a.dashboard.last_doctor = Some(Instant::now());
+                    match outcome {
+                        Ok(report) => {
+                            a.dashboard.doctor = Some(report);
+                            a.dashboard.doctor_error = None;
+                        }
+                        Err(e) => a.dashboard.doctor_error = Some(e),
+                    }
+                }
             }
             let mut a = handle.lock().await;
             a.running = None;
@@ -220,6 +369,7 @@ impl App {
             Job::Discover => self.discovery.running = running,
             Job::Inspect(_) => self.inspect.running = running,
             Job::Bootstrap => self.bootstrap.running = running,
+            Job::PollPeers | Job::Services | Job::Doctor => {}
         }
     }
 }

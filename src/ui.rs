@@ -1,11 +1,14 @@
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
+};
 use ratatui::Frame;
 
 use crate::app::{App, ProbeState, Screen};
 use crate::bootstrap::{BOOTSTRAP_DIR, BOOTSTRAP_REPO};
+use crate::peers::{format_age, format_rate, PeerStatus};
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const GOOD: Style = Style::new().fg(Color::Green);
@@ -27,6 +30,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::Preflight => draw_preflight(f, app, chunks[1]),
         Screen::Discovery => draw_discovery(f, app, chunks[1]),
         Screen::Inspect => draw_inspect(f, app, chunks[1]),
+        Screen::Dashboard => draw_dashboard(f, app, chunks[1]),
     }
     draw_hints(f, app, chunks[2]);
 }
@@ -249,12 +253,132 @@ fn draw_hints(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             if app.bootstrap.confirm_pending {
                 " B confirm bootstrap · Esc cancel "
             } else {
-                " q quit · r re-probe · d discover containers · b bootstrap CLI "
+                " q quit · r re-probe · d discover containers · b bootstrap CLI · g dashboard "
             }
         }
         Screen::Discovery => " ↑↓ select · Enter inspect · d re-scan · Esc back ",
         Screen::Inspect => " Esc back · q quit ",
+        Screen::Dashboard => " Esc back · auto-refresh 3s ",
     };
     let hints = Paragraph::new(hints).block(Block::default().borders(Borders::ALL).title(" keys "));
     f.render_widget(hints, area);
+}
+
+fn draw_dashboard(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let d = &app.dashboard;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(5),
+        ])
+        .split(area);
+
+    let services = match &d.services_error {
+        Some(e) => Line::from(Span::styled(format!("services: {e}"), BAD)),
+        None if d.services.is_empty() => Line::from(Span::styled(
+            "services: no amnezia-mesh stack containers (not initialized yet?)".to_string(),
+            DIM,
+        )),
+        None => Line::from(
+            d.services
+                .iter()
+                .map(|c| {
+                    Span::styled(
+                        format!(" {}: {} ", c.name, c.status),
+                        if c.running { GOOD } else { WARN },
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ),
+    };
+    f.render_widget(
+        Paragraph::new(services).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" services (amnezia-mesh stack) "),
+        ),
+        chunks[0],
+    );
+
+    let mut status_spans = Vec::new();
+    match (&d.doctor, &d.doctor_error) {
+        (Some(report), _) => {
+            let failed = report.failed();
+            if report.ok && failed.is_empty() {
+                status_spans.push(Span::styled(
+                    format!(
+                        " ✓ doctor: {}/{} checks ok ",
+                        report.checks.len(),
+                        report.checks.len()
+                    ),
+                    GOOD,
+                ));
+            } else {
+                let first = failed.first();
+                status_spans.push(Span::styled(
+                    format!(
+                        " ✗ doctor: {} failed ({}: {}) ",
+                        failed.len().max(1),
+                        first.map(|c| c.name.as_str()).unwrap_or("?"),
+                        first.map(|c| c.detail.as_str()).unwrap_or("")
+                    ),
+                    BAD,
+                ));
+            }
+        }
+        (None, Some(e)) => status_spans.push(Span::styled(format!(" doctor: {e} "), WARN)),
+        (None, None) => status_spans.push(Span::styled(" doctor: polling… ", DIM)),
+    }
+    if let Some(e) = &d.peers_error {
+        status_spans.push(Span::styled(format!(" peers: {e} "), BAD));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(status_spans))
+            .block(Block::default().borders(Borders::ALL).title(" status ")),
+        chunks[1],
+    );
+
+    let header = Row::new(["NAME", "IP", "STATUS", "HANDSHAKE", "ENDPOINT", "RX", "TX"])
+        .style(Style::default().fg(Color::DarkGray));
+    let rows = d.peers.iter().map(|p| {
+        let (icon, style) = match p.status {
+            PeerStatus::Live => ("●", GOOD),
+            PeerStatus::Stale => ("◐", WARN),
+            PeerStatus::Dead => ("○", DIM),
+        };
+        Row::new(vec![
+            Cell::from(p.name.clone()),
+            Cell::from(p.ip.clone()),
+            Cell::from(Span::styled(format!("{icon} {}", p.status.as_str()), style)),
+            Cell::from(
+                p.handshake
+                    .map(format_age)
+                    .unwrap_or_else(|| "never".into()),
+            ),
+            Cell::from(p.endpoint.clone().unwrap_or_else(|| "—".into())),
+            Cell::from(format_rate(p.rx_rate)),
+            Cell::from(format_rate(p.tx_rate)),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(22),
+            Constraint::Length(14),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Min(20),
+            Constraint::Length(12),
+            Constraint::Length(12),
+        ],
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" peers — {} · refresh 3s ", d.peers.len())),
+    )
+    .header(header);
+    f.render_widget(table, chunks[2]);
 }
