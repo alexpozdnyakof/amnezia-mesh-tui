@@ -1,5 +1,6 @@
 mod app;
 mod bootstrap;
+mod chart;
 mod config;
 mod docker;
 mod doctor;
@@ -376,6 +377,7 @@ async fn handle_key(app: &Arc<Mutex<App>>, key: KeyEvent) -> bool {
                 }
             }
             KeyCode::Tab => a.cycle_peer_filter(),
+            KeyCode::Char('v') => a.cycle_log_view(),
             KeyCode::Up => a.scroll_log(-1),
             KeyCode::Down => a.scroll_log(1),
             KeyCode::PageUp => a.scroll_log(-10),

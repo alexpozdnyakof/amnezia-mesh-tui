@@ -1,13 +1,19 @@
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
+    Axis, Block, Borders, Cell, Chart, Dataset, GraphType, List, ListItem, ListState, Paragraph,
+    Row, Table, Wrap,
 };
 use ratatui::Frame;
 
-use crate::app::{App, ProbeState, Screen};
+use crate::app::{App, LogView, ProbeState, Screen};
 use crate::bootstrap::{BOOTSTRAP_DIR, BOOTSTRAP_REPO};
+use crate::chart::{
+    downsample, entries_end, presence_heatmap, traffic_series, HeatCell, TrafficPoint,
+    BUCKET_MINUTES, HEATMAP_HOURS,
+};
 use crate::logs::STATS_LOG_PATH;
 use crate::peers::{format_age, format_bytes, format_rate, short_pubkey, PeerStatus};
 
@@ -258,9 +264,14 @@ fn draw_hints(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             .map(|fp| log_peer_name(app, fp))
             .unwrap_or_else(|| "all".to_string());
         format!(
-            " ↑↓ PgUp/PgDn scroll · Home/End jump · G bottom+follow · f follow:{} · Tab filter:{} · Esc back ",
+            " ↑↓ PgUp/PgDn scroll · G bottom · f follow:{} · Tab filter:{} · v view:{} · Esc back ",
             if app.log.follow { "on" } else { "off" },
             filter,
+            match app.log.view {
+                LogView::List => "list",
+                LogView::Chart => "chart",
+                LogView::Heat => "heat",
+            },
         )
     } else {
         let s: &str = match app.screen {
@@ -300,6 +311,14 @@ fn short_ts(at: &str) -> String {
 }
 
 fn draw_log(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    match app.log.view {
+        LogView::List => draw_log_list(f, app, area),
+        LogView::Chart => draw_log_chart(f, app, area),
+        LogView::Heat => draw_log_heat(f, app, area),
+    }
+}
+
+fn draw_log_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let log = &app.log;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -381,6 +400,132 @@ fn draw_log(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .highlight_symbol("> ");
     let mut state = ListState::default().with_selected((!is_empty).then_some(selected));
     f.render_stateful_widget(list, chunks[1], &mut state);
+}
+
+fn draw_log_chart(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let log = &app.log;
+    let Some(fp) = log.filter.as_deref() else {
+        let hint = Paragraph::new(Span::styled(
+            " Tab — select a peer to chart (filter: all)".to_string(),
+            WARN,
+        ))
+        .block(Block::default().borders(Borders::ALL).title(" rx/tx "));
+        f.render_widget(hint, area);
+        return;
+    };
+    let name = log_peer_name(app, fp);
+    let series = traffic_series(&log.entries, fp);
+    let points = downsample(&series, (area.width as usize).saturating_sub(8));
+    if points.is_empty() {
+        let hint = Paragraph::new(Span::styled(
+            " no counter data for this peer yet".to_string(),
+            DIM,
+        ))
+        .block(Block::default().borders(Borders::ALL).title(" rx/tx "));
+        f.render_widget(hint, area);
+        return;
+    }
+    let n = points.len();
+    let max_y = points
+        .iter()
+        .fold(0.0_f64, |m, p| m.max(p.rx).max(p.tx))
+        .max(1.0);
+    let data_rx: Vec<(f64, f64)> = points
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (i as f64, p.rx))
+        .collect();
+    let data_tx: Vec<(f64, f64)> = points
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (i as f64, p.tx))
+        .collect();
+    let fmt_time = |p: &TrafficPoint| p.ts.format("%m-%d %H:%M").to_string();
+    let x_labels = vec![
+        fmt_time(&points[0]),
+        fmt_time(&points[n / 2]),
+        fmt_time(&points[n - 1]),
+    ];
+    let y_top = format_bytes(max_y);
+    let chart = Chart::new(vec![
+        Dataset::default()
+            .name("rx")
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(GOOD)
+            .data(&data_rx),
+        Dataset::default()
+            .name("tx")
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Cyan))
+            .data(&data_tx),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" rx/tx — {name} · {n} samples ")),
+    )
+    .x_axis(
+        Axis::default()
+            .bounds([0.0, (n - 1).max(1) as f64])
+            .labels(x_labels),
+    )
+    .y_axis(
+        Axis::default()
+            .bounds([0.0, max_y * 1.1])
+            .labels(vec!["0".to_string(), y_top]),
+    );
+    f.render_widget(chart, area);
+}
+
+fn draw_log_heat(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let log = &app.log;
+    let Some(now) = entries_end(&log.entries) else {
+        let hint = Paragraph::new(Span::styled(" no log data yet".to_string(), DIM)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" presence · 24h "),
+        );
+        f.render_widget(hint, area);
+        return;
+    };
+    let rows = presence_heatmap(&log.entries, now);
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("window: ", DIM),
+        Span::styled(
+            format!(
+                "{} → {} · buckets of {} min ",
+                (now - chrono::Duration::hours(HEATMAP_HOURS)).format("%m-%d %H:%M"),
+                now.format("%m-%d %H:%M"),
+                BUCKET_MINUTES
+            ),
+            Style::default(),
+        ),
+        Span::styled("█ online · ", GOOD),
+        Span::styled("· offline", DIM),
+    ]));
+    for row in &rows {
+        let mut spans = vec![Span::styled(
+            format!("{:<20} ", log_peer_name(app, &row.peer)),
+            Style::default(),
+        )];
+        for cell in &row.cells {
+            spans.push(match cell {
+                HeatCell::Online => Span::styled("█", GOOD),
+                HeatCell::Offline => Span::styled("·", DIM),
+                HeatCell::NoData => Span::raw(" "),
+            });
+        }
+        lines.push(Line::from(spans));
+    }
+    let body = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" presence · last 24h "),
+    );
+    f.render_widget(body, area);
 }
 
 fn draw_dashboard(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {

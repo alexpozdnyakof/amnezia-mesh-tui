@@ -94,7 +94,7 @@ pub fn parse_show(text: &str) -> Result<ShowInfo, String> {
 }
 
 /// "1 minute, 23 seconds ago" / "2 hours ago" → age. "off"/"0"/absent → None.
-fn parse_handshake_age(s: &str) -> Option<Duration> {
+pub(crate) fn parse_handshake_age(s: &str) -> Option<Duration> {
     let s = s.trim();
     if s.is_empty() || s == "off" || s == "0" {
         return None;

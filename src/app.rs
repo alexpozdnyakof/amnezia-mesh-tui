@@ -44,6 +44,14 @@ pub enum Screen {
     Log,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LogView {
+    #[default]
+    List,
+    Chart,
+    Heat,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProbeState {
     Idle,
@@ -102,6 +110,7 @@ pub struct LogState {
     pub follow: bool,
     /// Selected row index into the *filtered* list.
     pub scroll: usize,
+    pub view: LogView,
     pub error: Option<String>,
     pub last_fetch: Option<Instant>,
     pub return_to: Option<Screen>,
@@ -223,6 +232,14 @@ impl App {
     pub fn log_bottom(&mut self) {
         self.log.scroll = self.visible_log_len().saturating_sub(1);
         self.log.follow = true;
+    }
+
+    pub fn cycle_log_view(&mut self) {
+        self.log.view = match self.log.view {
+            LogView::List => LogView::Chart,
+            LogView::Chart => LogView::Heat,
+            LogView::Heat => LogView::List,
+        };
     }
 
     fn due(at: Option<Instant>, interval: Duration) -> bool {

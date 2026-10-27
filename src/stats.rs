@@ -5,18 +5,27 @@
 ///
 /// Tolerated quirks (seen live): empty blocks, duplicate `=== ===` headers,
 /// docker error text inside blocks (container down at sample time).
+use chrono::{DateTime, FixedOffset};
+
 use crate::show::parse_transfer;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StatsEntry {
     /// Raw `=== ... ===` header timestamp (ISO8601 from `date -Is`).
     pub at: String,
+    /// Parsed `at`; None when the header was not RFC3339.
+    pub ts: Option<DateTime<FixedOffset>>,
     pub peer: String,
     pub endpoint: Option<String>,
     /// Raw age text ("1 minute, 23 seconds ago"); "off"/absent → None.
     pub handshake: Option<String>,
     pub rx: Option<u64>,
     pub tx: Option<u64>,
+}
+
+/// `date -Is` → "2026-10-27T08:00:01+07:00" (RFC3339).
+pub fn parse_ts(s: &str) -> Option<DateTime<FixedOffset>> {
+    DateTime::parse_from_rfc3339(s.trim()).ok()
 }
 
 pub fn parse_stats_log(text: &str) -> Vec<StatsEntry> {
@@ -40,6 +49,7 @@ pub fn parse_stats_log(text: &str) -> Vec<StatsEntry> {
             flush(&mut cur, &mut entries);
             cur = Some(StatsEntry {
                 at: at.clone(),
+                ts: parse_ts(&at),
                 peer: pubkey.trim().to_string(),
                 ..StatsEntry::default()
             });
