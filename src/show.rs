@@ -119,7 +119,7 @@ fn parse_handshake_age(s: &str) -> Option<Duration> {
 }
 
 /// "1.2 MiB received, 3.4 MiB sent" → (rx, tx) in bytes.
-fn parse_transfer(s: &str) -> Option<(u64, u64)> {
+pub(crate) fn parse_transfer(s: &str) -> Option<(u64, u64)> {
     let (rx_part, tx_part) = s.split_once(" received,")?;
     let tx_part = tx_part.trim().strip_suffix(" sent")?;
     Some((parse_bytes(rx_part)?, parse_bytes(tx_part)?))

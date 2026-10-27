@@ -4,11 +4,14 @@ mod config;
 mod docker;
 mod doctor;
 mod inspect;
+mod logs;
 mod peers;
 mod probe;
 mod show;
+mod stats;
 mod transport;
 mod ui;
+mod watchdog;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -324,6 +327,7 @@ async fn handle_key(app: &Arc<Mutex<App>>, key: KeyEvent) -> bool {
                 }
             }
             KeyCode::Char('g') => a.enter_dashboard(),
+            KeyCode::Char('l') => a.enter_log(Screen::Preflight),
             KeyCode::Esc => a.bootstrap.confirm_pending = false,
             _ => {}
         },
@@ -358,11 +362,31 @@ async fn handle_key(app: &Arc<Mutex<App>>, key: KeyEvent) -> bool {
                 a.screen = Screen::Discovery;
             }
         }
-        Screen::Dashboard => {
-            if key.code == KeyCode::Esc {
-                a.screen = Screen::Preflight;
+        Screen::Dashboard => match key.code {
+            KeyCode::Esc => a.screen = Screen::Preflight,
+            KeyCode::Char('l') => a.enter_log(Screen::Dashboard),
+            _ => {}
+        },
+        Screen::Log => match key.code {
+            KeyCode::Esc => a.screen = a.log.return_to.unwrap_or(Screen::Preflight),
+            KeyCode::Char('f') => {
+                a.log.follow = !a.log.follow;
+                if a.log.follow {
+                    a.log_bottom();
+                }
             }
-        }
+            KeyCode::Tab => a.cycle_peer_filter(),
+            KeyCode::Up => a.scroll_log(-1),
+            KeyCode::Down => a.scroll_log(1),
+            KeyCode::PageUp => a.scroll_log(-10),
+            KeyCode::PageDown => a.scroll_log(10),
+            KeyCode::Home => {
+                a.log.follow = false;
+                a.log.scroll = 0;
+            }
+            KeyCode::End | KeyCode::Char('G') => a.log_bottom(),
+            _ => {}
+        },
     }
     false
 }

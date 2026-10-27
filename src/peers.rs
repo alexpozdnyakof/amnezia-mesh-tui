@@ -152,15 +152,22 @@ pub fn format_age(age: Duration) -> String {
     }
 }
 
-/// "512 B/s", "1.2 KiB/s", "3.1 MiB/s"
-pub fn format_rate(bytes_per_sec: f64) -> String {
-    if bytes_per_sec < 1024.0 {
-        format!("{:.0} B/s", bytes_per_sec)
-    } else if bytes_per_sec < 1024.0_f64.powi(2) {
-        format!("{:.1} KiB/s", bytes_per_sec / 1024.0)
+/// "512 B", "1.5 KiB", "12.5 MiB", "1.3 GiB"
+pub fn format_bytes(bytes: f64) -> String {
+    if bytes < 1024.0 {
+        format!("{:.0} B", bytes)
+    } else if bytes < 1024.0_f64.powi(2) {
+        format!("{:.1} KiB", bytes / 1024.0)
+    } else if bytes < 1024.0_f64.powi(3) {
+        format!("{:.1} MiB", bytes / 1024.0_f64.powi(2))
     } else {
-        format!("{:.1} MiB/s", bytes_per_sec / 1024.0_f64.powi(2))
+        format!("{:.1} GiB", bytes / 1024.0_f64.powi(3))
     }
+}
+
+/// "512 B/s", "1.5 KiB/s", "12.5 MiB/s"
+pub fn format_rate(bytes_per_sec: f64) -> String {
+    format!("{}/s", format_bytes(bytes_per_sec))
 }
 
 #[cfg(test)]

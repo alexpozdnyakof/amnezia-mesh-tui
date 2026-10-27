@@ -8,7 +8,8 @@ use ratatui::Frame;
 
 use crate::app::{App, ProbeState, Screen};
 use crate::bootstrap::{BOOTSTRAP_DIR, BOOTSTRAP_REPO};
-use crate::peers::{format_age, format_rate, PeerStatus};
+use crate::logs::STATS_LOG_PATH;
+use crate::peers::{format_age, format_bytes, format_rate, short_pubkey, PeerStatus};
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const GOOD: Style = Style::new().fg(Color::Green);
@@ -31,6 +32,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::Discovery => draw_discovery(f, app, chunks[1]),
         Screen::Inspect => draw_inspect(f, app, chunks[1]),
         Screen::Dashboard => draw_dashboard(f, app, chunks[1]),
+        Screen::Log => draw_log(f, app, chunks[1]),
     }
     draw_hints(f, app, chunks[2]);
 }
@@ -248,20 +250,137 @@ fn draw_inspect(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn draw_hints(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let hints: &str = match app.screen {
-        Screen::Preflight => {
-            if app.bootstrap.confirm_pending {
-                " B confirm bootstrap · Esc cancel "
-            } else {
-                " q quit · r re-probe · d discover containers · b bootstrap CLI · g dashboard "
+    let hints: String = if app.screen == Screen::Log {
+        let filter = app
+            .log
+            .filter
+            .as_deref()
+            .map(|fp| log_peer_name(app, fp))
+            .unwrap_or_else(|| "all".to_string());
+        format!(
+            " ↑↓ PgUp/PgDn scroll · Home/End jump · G bottom+follow · f follow:{} · Tab filter:{} · Esc back ",
+            if app.log.follow { "on" } else { "off" },
+            filter,
+        )
+    } else {
+        let s: &str = match app.screen {
+            Screen::Preflight => {
+                if app.bootstrap.confirm_pending {
+                    " B confirm bootstrap · Esc cancel "
+                } else {
+                    " q quit · r re-probe · d discover · b bootstrap · g dashboard · l logs "
+                }
             }
-        }
-        Screen::Discovery => " ↑↓ select · Enter inspect · d re-scan · Esc back ",
-        Screen::Inspect => " Esc back · q quit ",
-        Screen::Dashboard => " Esc back · auto-refresh 3s ",
+            Screen::Discovery => " ↑↓ select · Enter inspect · d re-scan · Esc back ",
+            Screen::Inspect => " Esc back · q quit ",
+            Screen::Dashboard => " Esc back · auto-refresh 3s · l logs ",
+            Screen::Log => unreachable!(),
+        };
+        s.to_string()
     };
     let hints = Paragraph::new(hints).block(Block::default().borders(Borders::ALL).title(" keys "));
     f.render_widget(hints, area);
+}
+
+fn log_peer_name(app: &App, pubkey: &str) -> String {
+    app.log
+        .names
+        .get(pubkey)
+        .cloned()
+        .unwrap_or_else(|| short_pubkey(pubkey))
+}
+
+/// "2026-10-26T20:38:42+07:00" → "10-26 20:38:42"
+fn short_ts(at: &str) -> String {
+    if at.len() >= 19 {
+        format!("{} {}", &at[5..10], &at[11..19])
+    } else {
+        at.to_string()
+    }
+}
+
+fn draw_log(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let log = &app.log;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(5)])
+        .split(area);
+
+    let wd = match log.events.last() {
+        None => Line::from(Span::styled("watchdog: no restart events".to_string(), DIM)),
+        Some(ev) => Line::from(vec![
+            Span::styled("watchdog: ", DIM),
+            Span::styled(format!("{} × {}", ev.kind.as_str(), log.events.len()), WARN),
+            Span::styled(
+                format!("  last: {} {} ", short_ts(&ev.at), ev.container),
+                DIM,
+            ),
+        ]),
+    };
+    f.render_widget(
+        Paragraph::new(wd).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" availability "),
+        ),
+        chunks[0],
+    );
+
+    let filter_label = log.filter.as_deref().map(|fp| log_peer_name(app, fp));
+    let mut items: Vec<ListItem> = Vec::new();
+    if let Some(e) = &log.error {
+        items.push(ListItem::new(Span::styled(format!("error: {e}"), BAD)));
+    }
+    for entry in log
+        .entries
+        .iter()
+        .filter(|e| log.filter.as_deref().is_none_or(|fp| e.peer == fp))
+    {
+        let hs = entry.handshake.as_deref().unwrap_or("never");
+        let hs_style = if entry.handshake.is_some() {
+            Style::default()
+        } else {
+            DIM
+        };
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(format!("{}  ", short_ts(&entry.at)), DIM),
+            Span::styled(
+                format!("{:<20} ", log_peer_name(app, &entry.peer)),
+                Style::default(),
+            ),
+            Span::styled(
+                format!("{:<22} ", entry.endpoint.as_deref().unwrap_or("—")),
+                DIM,
+            ),
+            Span::styled(format!("{:<28} ", hs), hs_style),
+            Span::styled(
+                format!(
+                    "↓{} ↑{}",
+                    format_bytes(entry.rx.unwrap_or(0) as f64),
+                    format_bytes(entry.tx.unwrap_or(0) as f64)
+                ),
+                GOOD,
+            ),
+        ])));
+    }
+    let selected = if log.follow {
+        items.len().saturating_sub(1)
+    } else {
+        log.scroll.min(items.len().saturating_sub(1))
+    };
+    let title = format!(
+        " stats log — {} entries · filter: {} · {} ",
+        items.len(),
+        filter_label.as_deref().unwrap_or("all"),
+        STATS_LOG_PATH,
+    );
+    let is_empty = items.is_empty();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::default().bg(Color::DarkGray))
+        .highlight_symbol("> ");
+    let mut state = ListState::default().with_selected((!is_empty).then_some(selected));
+    f.render_stateful_widget(list, chunks[1], &mut state);
 }
 
 fn draw_dashboard(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {

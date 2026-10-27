@@ -10,14 +10,18 @@ use crate::config::{Config, ServerConfig};
 use crate::docker::{discover, stack_services, ContainerInfo};
 use crate::doctor::{doctor, DoctorReport};
 use crate::inspect::{inspect, InspectSummary};
+use crate::logs::{fetch_stats_log, fetch_watchdog_log};
 use crate::peers::{fetch_names, resolve_peers, PeerSample, ResolvedPeer};
 use crate::probe::{probe, ProbeResult};
 use crate::show::parse_show;
+use crate::stats::{parse_stats_log, StatsEntry};
 use crate::transport::Transport;
+use crate::watchdog::{parse_watchdog_log, WatchdogEvent};
 
 const PEERS_INTERVAL: Duration = Duration::from_secs(3);
 const SERVICES_INTERVAL: Duration = Duration::from_secs(10);
 const DOCTOR_INTERVAL: Duration = Duration::from_secs(45);
+const LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Job {
@@ -28,6 +32,7 @@ pub enum Job {
     PollPeers,
     Services,
     Doctor,
+    FetchLog,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -36,6 +41,7 @@ pub enum Screen {
     Discovery,
     Inspect,
     Dashboard,
+    Log,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -84,6 +90,23 @@ pub struct DashboardState {
     pub last_doctor: Option<Instant>,
 }
 
+/// Stats/watchdog log viewer state (M3).
+#[derive(Debug, Default)]
+pub struct LogState {
+    pub entries: Vec<StatsEntry>,
+    pub events: Vec<WatchdogEvent>,
+    /// pubkey → name (from `peer list --json`, refreshed with every fetch).
+    pub names: HashMap<String, String>,
+    /// Active filter: exact pubkey; None = all peers.
+    pub filter: Option<String>,
+    pub follow: bool,
+    /// Selected row index into the *filtered* list.
+    pub scroll: usize,
+    pub error: Option<String>,
+    pub last_fetch: Option<Instant>,
+    pub return_to: Option<Screen>,
+}
+
 #[derive(Debug)]
 pub struct App {
     pub server_name: String,
@@ -96,6 +119,7 @@ pub struct App {
     pub inspect: InspectState,
     pub bootstrap: BootstrapState,
     pub dashboard: DashboardState,
+    pub log: LogState,
     queue: Vec<Job>,
     running: Option<Job>,
 }
@@ -118,6 +142,7 @@ impl App {
             inspect: InspectState::default(),
             bootstrap: BootstrapState::default(),
             dashboard: DashboardState::default(),
+            log: LogState::default(),
             queue: vec![Job::Probe],
             running: None,
         }
@@ -151,24 +176,81 @@ impl App {
         self.request(Job::Doctor);
     }
 
+    /// Open the log viewer, returning to `from` on Esc.
+    pub fn enter_log(&mut self, from: Screen) {
+        self.screen = Screen::Log;
+        self.log.return_to = Some(from);
+        self.log.follow = true;
+        self.log.scroll = 0;
+        self.log.filter = None;
+        self.log.last_fetch = None;
+        self.request(Job::FetchLog);
+    }
+
+    /// Tab: cycle the peer filter through [all, first, second, …, all].
+    pub fn cycle_peer_filter(&mut self) {
+        let mut pubs: Vec<String> = Vec::new();
+        for e in &self.log.entries {
+            if !pubs.contains(&e.peer) {
+                pubs.push(e.peer.clone());
+            }
+        }
+        self.log.filter = match &self.log.filter {
+            None => pubs.first().cloned(),
+            Some(cur) => match pubs.iter().position(|p| p == cur) {
+                Some(i) if i + 1 < pubs.len() => Some(pubs[i + 1].clone()),
+                _ => None,
+            },
+        };
+        self.log.scroll = 0;
+    }
+
+    pub fn visible_log_len(&self) -> usize {
+        self.log
+            .entries
+            .iter()
+            .filter(|e| self.log.filter.as_deref().is_none_or(|fp| e.peer == fp))
+            .count()
+    }
+
+    pub fn scroll_log(&mut self, delta: isize) {
+        self.log.follow = false;
+        let len = self.visible_log_len() as isize;
+        let s = (self.log.scroll as isize + delta).clamp(0, (len - 1).max(0));
+        self.log.scroll = s as usize;
+    }
+
+    pub fn log_bottom(&mut self) {
+        self.log.scroll = self.visible_log_len().saturating_sub(1);
+        self.log.follow = true;
+    }
+
     fn due(at: Option<Instant>, interval: Duration) -> bool {
         at.is_none_or(|t| t.elapsed() >= interval)
     }
 
-    /// Queue periodic dashboard polls when their interval has elapsed.
+    /// Queue periodic polls when their interval has elapsed.
     /// Called from `pump` on every tick; `request` dedups.
     fn schedule_periodics(&mut self) {
-        if self.screen != Screen::Dashboard || self.running.is_some() {
+        if self.running.is_some() {
             return;
         }
-        if Self::due(self.dashboard.last_peers, PEERS_INTERVAL) {
-            self.request(Job::PollPeers);
+        if self.screen == Screen::Dashboard {
+            if Self::due(self.dashboard.last_peers, PEERS_INTERVAL) {
+                self.request(Job::PollPeers);
+            }
+            if Self::due(self.dashboard.last_services, SERVICES_INTERVAL) {
+                self.request(Job::Services);
+            }
+            if Self::due(self.dashboard.last_doctor, DOCTOR_INTERVAL) {
+                self.request(Job::Doctor);
+            }
         }
-        if Self::due(self.dashboard.last_services, SERVICES_INTERVAL) {
-            self.request(Job::Services);
-        }
-        if Self::due(self.dashboard.last_doctor, DOCTOR_INTERVAL) {
-            self.request(Job::Doctor);
+        if self.screen == Screen::Log
+            && self.log.follow
+            && Self::due(self.log.last_fetch, LOG_INTERVAL)
+        {
+            self.request(Job::FetchLog);
         }
     }
 
@@ -357,6 +439,34 @@ impl App {
                         Err(e) => a.dashboard.doctor_error = Some(e),
                     }
                 }
+                Job::FetchLog => {
+                    let cli = {
+                        let a = handle.lock().await;
+                        a.server.cli_path.clone()
+                    };
+                    let outcome = async {
+                        let stats = fetch_stats_log(&transport).await?;
+                        let watchdog = fetch_watchdog_log(&transport).await?;
+                        let names = fetch_names(&transport, &cli).await;
+                        Ok((
+                            parse_stats_log(&stats),
+                            parse_watchdog_log(&watchdog),
+                            names,
+                        ))
+                    }
+                    .await;
+                    let mut a = handle.lock().await;
+                    a.log.last_fetch = Some(Instant::now());
+                    match outcome {
+                        Ok((entries, events, names)) => {
+                            a.log.entries = entries;
+                            a.log.events = events;
+                            a.log.names = names;
+                            a.log.error = None;
+                        }
+                        Err(e) => a.log.error = Some(e),
+                    }
+                }
             }
             let mut a = handle.lock().await;
             a.running = None;
@@ -369,7 +479,70 @@ impl App {
             Job::Discover => self.discovery.running = running,
             Job::Inspect(_) => self.inspect.running = running,
             Job::Bootstrap => self.bootstrap.running = running,
-            Job::PollPeers | Job::Services | Job::Doctor => {}
+            Job::PollPeers | Job::Services | Job::Doctor | Job::FetchLog => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::mock_canned;
+
+    fn test_app() -> App {
+        let server = ServerConfig {
+            ssh_alias: "mock".into(),
+            cli_path: "awg-mesh".into(),
+            container: "amnezia-legacy-test".into(),
+            login_shell: "sh".into(),
+        };
+        let mut config = Config {
+            active_server: "mock".into(),
+            servers: std::collections::BTreeMap::new(),
+        };
+        config.servers.insert("mock".into(), server.clone());
+        App::new("mock".into(), server, config, PathBuf::from("/tmp/none"))
+    }
+
+    #[tokio::test]
+    async fn fetch_log_job_fills_log_state() {
+        let app = Arc::new(Mutex::new(test_app()));
+        let transport = mock_canned();
+        app.lock().await.enter_log(Screen::Preflight);
+        // App::new seeds the queue with Probe — pump until FetchLog lands.
+        for _ in 0..50 {
+            App::pump(&app, &transport).await;
+            if app.lock().await.log.last_fetch.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let a = app.lock().await;
+        assert!(a.log.error.is_none(), "log error: {:?}", a.log.error);
+        assert_eq!(a.log.entries.len(), 7);
+        assert_eq!(a.log.events.len(), 2);
+        assert_eq!(a.log.names.len(), 3);
+        assert!(a.log.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn peer_filter_cycles_all_then_each_peer() {
+        let mut app = test_app();
+        app.log.entries = vec![
+            StatsEntry {
+                peer: "P1".into(),
+                ..StatsEntry::default()
+            },
+            StatsEntry {
+                peer: "P2".into(),
+                ..StatsEntry::default()
+            },
+        ];
+        app.cycle_peer_filter();
+        assert_eq!(app.log.filter.as_deref(), Some("P1"));
+        app.cycle_peer_filter();
+        assert_eq!(app.log.filter.as_deref(), Some("P2"));
+        app.cycle_peer_filter();
+        assert_eq!(app.log.filter, None);
     }
 }
