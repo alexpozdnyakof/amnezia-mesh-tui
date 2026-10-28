@@ -12,6 +12,7 @@ use crate::doctor::{doctor, DoctorReport};
 use crate::geo::{endpoint_ip, GeoDb, GeoInfo};
 use crate::inspect::{inspect, InspectSummary};
 use crate::logs::{fetch_stats_log, fetch_watchdog_log};
+use crate::mutate::{self, MutateError, PeerAdded};
 use crate::peers::{fetch_names, resolve_peers, PeerSample, PeerStatus, ResolvedPeer};
 use crate::probe::{probe, ProbeResult};
 use crate::show::parse_show;
@@ -34,6 +35,14 @@ pub enum Job {
     Services,
     Doctor,
     FetchLog,
+    Mutate(Mutation),
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Mutation {
+    Add(String),
+    Rename { old: String, new: String },
+    Revoke(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -44,6 +53,7 @@ pub enum Screen {
     Dashboard,
     Map,
     Log,
+    Secret,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -105,9 +115,48 @@ pub struct DashboardState {
     pub doctor: Option<DoctorReport>,
     pub doctor_error: Option<String>,
     pub geo: Vec<PeerGeo>,
+    pub selected: usize,
+    /// Inline text input (peer add / rename) rendered in the keys bar.
+    pub input: Option<InputState>,
+    /// Peer name pending the revoke confirmation.
+    pub confirm: Option<String>,
+    /// Last mutation result: (message, is_error).
+    pub notice: Option<(String, bool)>,
+    /// Poll failures are hidden for a while after a mutation (the stack
+    /// restarts, ~5-10s of errors is expected).
+    pub poll_silence: Option<Instant>,
     pub last_peers: Option<Instant>,
     pub last_services: Option<Instant>,
     pub last_doctor: Option<Instant>,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum InputKind {
+    AddPeer,
+    RenamePeer(String),
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct InputState {
+    pub prompt: String,
+    pub value: String,
+    pub kind: InputKind,
+}
+
+/// Freshly issued key material (M4). Shown once, zeroized on close.
+#[derive(Debug)]
+pub struct SecretState {
+    pub name: String,
+    pub ip: String,
+    pub profile: String,
+    pub saved_to: Option<String>,
+}
+
+impl Drop for SecretState {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.profile.zeroize();
+    }
 }
 
 /// Stats/watchdog log viewer state (M3).
@@ -143,6 +192,7 @@ pub struct App {
     pub log: LogState,
     pub geo_db: Option<GeoDb>,
     pub geo_error: Option<String>,
+    pub secret: Option<SecretState>,
     queue: Vec<Job>,
     running: Option<Job>,
 }
@@ -177,6 +227,7 @@ impl App {
             log: LogState::default(),
             geo_db,
             geo_error,
+            secret: None,
             queue: vec![Job::Probe],
             running: None,
         }
@@ -265,6 +316,108 @@ impl App {
             LogView::Chart => LogView::Heat,
             LogView::Heat => LogView::List,
         };
+    }
+
+    // --- M4: mutations (input, confirm, secret) ---
+
+    pub fn open_add_input(&mut self) {
+        self.dashboard.notice = None;
+        self.dashboard.input = Some(InputState {
+            prompt: "add peer — name".to_string(),
+            value: String::new(),
+            kind: InputKind::AddPeer,
+        });
+    }
+
+    pub fn open_rename_input(&mut self) {
+        let Some(peer) = self.selected_peer().cloned() else {
+            return;
+        };
+        self.dashboard.notice = None;
+        self.dashboard.input = Some(InputState {
+            prompt: format!("rename {0} — new name", peer.name),
+            value: String::new(),
+            kind: InputKind::RenamePeer(peer.name),
+        });
+    }
+
+    pub fn selected_peer(&self) -> Option<&ResolvedPeer> {
+        self.dashboard.peers.get(self.dashboard.selected)
+    }
+
+    pub fn push_input_char(&mut self, c: char) {
+        if let Some(input) = &mut self.dashboard.input {
+            if input.value.len() < 32 {
+                input.value.push(c);
+            }
+        }
+    }
+
+    pub fn pop_input_char(&mut self) {
+        if let Some(input) = &mut self.dashboard.input {
+            input.value.pop();
+        }
+    }
+
+    pub fn cancel_input(&mut self) {
+        self.dashboard.input = None;
+    }
+
+    /// Enter on the input bar: validate and queue the mutation.
+    pub fn submit_input(&mut self) {
+        let Some(input) = self.dashboard.input.take() else {
+            return;
+        };
+        if !mutate::valid_name(&input.value) {
+            self.dashboard.notice = Some((
+                "invalid name: lowercase letters, digits, dash, max 32".into(),
+                true,
+            ));
+            return;
+        }
+        match input.kind {
+            InputKind::AddPeer => self.request(Job::Mutate(Mutation::Add(input.value))),
+            InputKind::RenamePeer(old) => self.request(Job::Mutate(Mutation::Rename {
+                old,
+                new: input.value,
+            })),
+        }
+    }
+
+    pub fn request_revoke(&mut self) {
+        let name = self.selected_peer().map(|p| p.name.clone());
+        if let Some(name) = name {
+            self.dashboard.notice = None;
+            self.dashboard.confirm = Some(name);
+        }
+    }
+
+    pub fn cancel_revoke(&mut self) {
+        self.dashboard.confirm = None;
+    }
+
+    pub fn confirm_revoke(&mut self) {
+        if let Some(name) = self.dashboard.confirm.take() {
+            self.request(Job::Mutate(Mutation::Revoke(name)));
+        }
+    }
+
+    /// Close the secret screen; the profile is zeroized on drop.
+    pub fn close_secret(&mut self) {
+        self.secret = None;
+        if self.screen == Screen::Secret {
+            self.screen = Screen::Dashboard;
+        }
+    }
+
+    pub fn mark_secret_saved(&mut self, path: String) {
+        if let Some(s) = &mut self.secret {
+            s.saved_to = Some(path);
+        }
+    }
+
+    fn mutate_notice(&mut self, message: String, is_error: bool) {
+        self.dashboard.notice = Some((message, is_error));
     }
 
     fn due(at: Option<Instant>, interval: Duration) -> bool {
@@ -476,7 +629,15 @@ impl App {
                                 })
                                 .unwrap_or_default();
                         }
-                        Err(e) => a.dashboard.peers_error = Some(e),
+                        Err(e) => {
+                            let silenced = a
+                                .dashboard
+                                .poll_silence
+                                .is_some_and(|until| Instant::now() < until);
+                            if !silenced {
+                                a.dashboard.peers_error = Some(e);
+                            }
+                        }
                     }
                 }
                 Job::Services => {
@@ -508,6 +669,73 @@ impl App {
                             a.dashboard.doctor_error = None;
                         }
                         Err(e) => a.dashboard.doctor_error = Some(e),
+                    }
+                }
+                Job::Mutate(mutation) => {
+                    enum Outcome {
+                        Added(PeerAdded, Option<String>),
+                        Renamed(String, String),
+                        Revoked(String),
+                    }
+                    let outcome = async {
+                        match &mutation {
+                            Mutation::Add(name) => {
+                                let added = mutate::peer_add(&transport, &server, name).await?;
+                                let vpn_path =
+                                    added.profiles.iter().find(|p| p.ends_with(".vpn")).cloned();
+                                let profile = match vpn_path {
+                                    Some(p) => Some(mutate::fetch_profile(&transport, &p).await?),
+                                    None => None,
+                                };
+                                Ok(Outcome::Added(added, profile))
+                            }
+                            Mutation::Rename { old, new } => {
+                                mutate::peer_rename(&transport, &server, old, new).await?;
+                                Ok(Outcome::Renamed(old.clone(), new.clone()))
+                            }
+                            Mutation::Revoke(name) => {
+                                mutate::peer_revoke(&transport, &server, name).await?;
+                                Ok(Outcome::Revoked(name.clone()))
+                            }
+                        }
+                    }
+                    .await
+                    .map_err(|e: MutateError| e.to_string());
+                    let mut a = handle.lock().await;
+                    // The stack restarts after every mutation: hush the
+                    // poll for a few seconds and refresh right away.
+                    a.dashboard.poll_silence = Some(Instant::now() + Duration::from_secs(10));
+                    a.queue.push(Job::PollPeers);
+                    match outcome {
+                        Ok(Outcome::Added(added, profile)) => {
+                            a.mutate_notice(format!("added {} → {}", added.name, added.ip), false);
+                            a.secret = Some(SecretState {
+                                name: added.name,
+                                ip: added.ip,
+                                profile: profile
+                                    .unwrap_or_else(|| "<profile unavailable>".to_string()),
+                                saved_to: None,
+                            });
+                            a.screen = Screen::Secret;
+                        }
+                        Ok(Outcome::Renamed(old, new)) => {
+                            a.mutate_notice(format!("renamed {old} → {new}"), false);
+                        }
+                        Ok(Outcome::Revoked(name)) => {
+                            a.mutate_notice(format!("revoked {name}"), false);
+                            a.dashboard.selected = 0;
+                        }
+                        Err(e) => a.mutate_notice(format!("mutation failed: {e}"), true),
+                    }
+                    if matches!(a.screen, Screen::Secret)
+                        || a.dashboard.notice.as_ref().is_some_and(|(_, err)| !err)
+                    {
+                        if let Some(hook) = a.config.post_mutation_hook.clone() {
+                            let _ = tokio::process::Command::new("sh")
+                                .arg("-c")
+                                .arg(hook)
+                                .spawn();
+                        }
                     }
                 }
                 Job::FetchLog => {
@@ -551,6 +779,7 @@ impl App {
             Job::Inspect(_) => self.inspect.running = running,
             Job::Bootstrap => self.bootstrap.running = running,
             Job::PollPeers | Job::Services | Job::Doctor | Job::FetchLog => {}
+            Job::Mutate(_) => {}
         }
     }
 }
@@ -571,6 +800,7 @@ mod tests {
         let mut config = Config {
             active_server: "mock".into(),
             servers: std::collections::BTreeMap::new(),
+            post_mutation_hook: None,
         };
         config.servers.insert("mock".into(), server.clone());
         App::new("mock".into(), server, config, PathBuf::from("/tmp/none"))

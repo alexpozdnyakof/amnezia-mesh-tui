@@ -42,6 +42,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::Dashboard => draw_dashboard(f, app, chunks[1]),
         Screen::Map => draw_map(f, app, chunks[1]),
         Screen::Log => draw_log(f, app, chunks[1]),
+        Screen::Secret => draw_secret(f, app, chunks[1]),
     }
     draw_hints(f, app, chunks[2]);
 }
@@ -276,6 +277,13 @@ fn draw_hints(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 LogView::Heat => "heat",
             },
         )
+    } else if let Some(input) = &app.dashboard.input {
+        format!(
+            " {}: {}_ · Enter confirm · Esc cancel ",
+            input.prompt, input.value
+        )
+    } else if let Some(name) = &app.dashboard.confirm {
+        format!(" revoke {name}? devices lose access · y confirm · any key cancel ")
     } else {
         let s: &str = match app.screen {
             Screen::Preflight => {
@@ -287,8 +295,11 @@ fn draw_hints(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             }
             Screen::Discovery => " ↑↓ select · Enter inspect · d re-scan · Esc back ",
             Screen::Inspect => " Esc back · q quit ",
-            Screen::Dashboard => " Esc back · auto-refresh 3s · l logs · m map ",
+            Screen::Dashboard => {
+                " ↑↓ select · a add · r rename · x revoke · l logs · m map · Esc back "
+            }
             Screen::Map => " Esc back · auto-refresh 3s · l logs ",
+            Screen::Secret => " s save to ~/Downloads · Esc close (secret cleared) ",
             Screen::Log => unreachable!(),
         };
         s.to_string()
@@ -602,6 +613,12 @@ fn draw_dashboard(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     if let Some(e) = &d.peers_error {
         status_spans.push(Span::styled(format!(" peers: {e} "), BAD));
     }
+    if let Some((msg, is_err)) = &d.notice {
+        status_spans.push(Span::styled(
+            format!(" {msg} "),
+            if *is_err { BAD } else { GOOD },
+        ));
+    }
     f.render_widget(
         Paragraph::new(Line::from(status_spans))
             .block(Block::default().borders(Borders::ALL).title(" status ")),
@@ -647,8 +664,15 @@ fn draw_dashboard(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             .borders(Borders::ALL)
             .title(format!(" peers — {} · refresh 3s ", d.peers.len())),
     )
-    .header(header);
-    f.render_widget(table, chunks[2]);
+    .header(header)
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+    let selected = (!d.peers.is_empty()).then_some(d.selected.min(d.peers.len() - 1));
+    let mut tstate = ratatui::widgets::TableState::default().with_selected(selected);
+    f.render_stateful_widget(table, chunks[2], &mut tstate);
 }
 
 fn map_status_color(status: PeerStatus) -> Color {
@@ -815,4 +839,37 @@ fn draw_map(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 .title(" connection map · hub-and-spoke "),
         );
     f.render_widget(canvas, chunks[0]);
+}
+
+fn draw_secret(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let Some(s) = &app.secret else { return };
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled("peer: ", DIM),
+            Span::styled(s.name.clone(), GOOD),
+            Span::styled("   ip: ", DIM),
+            Span::raw(s.ip.clone()),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            " .vpn profile — import in the Amnezia app:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+    ];
+    let budget = (area.height as usize).saturating_sub(8);
+    for l in s.profile.lines().take(budget) {
+        lines.push(Line::from(Span::styled(l.to_string(), GOOD)));
+    }
+    if let Some(p) = &s.saved_to {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(format!("saved: {p}"), GOOD)));
+    }
+    let body = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" new peer — shown once · {} ", s.name)),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(body, area);
 }

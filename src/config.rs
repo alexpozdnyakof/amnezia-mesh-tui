@@ -62,6 +62,10 @@ pub struct Config {
     pub active_server: String,
     #[serde(default)]
     pub servers: std::collections::BTreeMap<String, ServerConfig>,
+    /// Local shell command run after every successful network mutation
+    /// (generic integration hook; runs on the machine with the TUI).
+    #[serde(default)]
+    pub post_mutation_hook: Option<String>,
 }
 
 impl Config {
@@ -71,6 +75,7 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config {
                 active_server: String::new(),
                 servers: std::collections::BTreeMap::new(),
+                post_mutation_hook: None,
             }),
             Err(e) => Err(e.into()),
         }

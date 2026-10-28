@@ -7,6 +7,7 @@ mod doctor;
 mod geo;
 mod inspect;
 mod logs;
+mod mutate;
 mod peers;
 mod probe;
 mod show;
@@ -364,10 +365,57 @@ async fn handle_key(app: &Arc<Mutex<App>>, key: KeyEvent) -> bool {
                 a.screen = Screen::Discovery;
             }
         }
-        Screen::Dashboard => match key.code {
-            KeyCode::Esc => a.screen = Screen::Preflight,
-            KeyCode::Char('l') => a.enter_log(Screen::Dashboard),
-            KeyCode::Char('m') => a.screen = Screen::Map,
+        Screen::Dashboard => {
+            if a.dashboard.input.is_some() {
+                match key.code {
+                    KeyCode::Enter => a.submit_input(),
+                    KeyCode::Esc => a.cancel_input(),
+                    KeyCode::Backspace => a.pop_input_char(),
+                    KeyCode::Char(c) => a.push_input_char(c),
+                    _ => {}
+                }
+            } else if a.dashboard.confirm.is_some() {
+                match key.code {
+                    KeyCode::Char('y') => a.confirm_revoke(),
+                    _ => a.cancel_revoke(),
+                }
+            } else {
+                match key.code {
+                    KeyCode::Esc => a.screen = Screen::Preflight,
+                    KeyCode::Up => {
+                        a.dashboard.selected = a.dashboard.selected.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        let len = a.dashboard.peers.len();
+                        if len > 0 {
+                            a.dashboard.selected = (a.dashboard.selected + 1).min(len - 1);
+                        }
+                    }
+                    KeyCode::Char('a') => a.open_add_input(),
+                    KeyCode::Char('r') => a.open_rename_input(),
+                    KeyCode::Char('x') | KeyCode::Delete => a.request_revoke(),
+                    KeyCode::Char('l') => a.enter_log(Screen::Dashboard),
+                    KeyCode::Char('m') => a.screen = Screen::Map,
+                    _ => {}
+                }
+            }
+        }
+        Screen::Secret => match key.code {
+            KeyCode::Char('s') => {
+                let saved = a.secret.as_ref().and_then(|s| {
+                    let dir = std::env::var_os("HOME")
+                        .map(PathBuf::from)?
+                        .join("Downloads");
+                    std::fs::create_dir_all(&dir).ok()?;
+                    let path = dir.join(format!("{}.vpn", s.name));
+                    std::fs::write(&path, s.profile.as_bytes()).ok()?;
+                    Some(path.display().to_string())
+                });
+                if let Some(p) = saved {
+                    a.mark_secret_saved(p);
+                }
+            }
+            KeyCode::Esc => a.close_secret(),
             _ => {}
         },
         Screen::Map => {

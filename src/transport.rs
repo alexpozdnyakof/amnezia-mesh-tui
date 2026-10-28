@@ -217,6 +217,24 @@ pub fn mock_canned() -> Transport {
                 .into(),
             ),
             (
+                "peer rename".into(),
+                r#"{"ok":true,"renamed":"test-phone","name":"renamed-phone"}"#.into(),
+            ),
+            (
+                "peer revoke".into(),
+                r#"{"ok":true,"revoked":"peer-k5lyeo"}"#.into(),
+            ),
+            (
+                "peer add".into(),
+                r#"{"ok":true,"name":"new-phone","ip":"10.8.1.5",
+                    "profiles":["/tmp/amnezia-mesh/config/peers/new-phone-exit.vpn",
+                                "/tmp/amnezia-mesh/config/peers/new-phone-mesh.vpn"]}"#.into(),
+            ),
+            (
+                "config/peers/new-phone".into(),
+                "vpn://eyJmb28iOiJiYXIifQ-example-profile-link\n".into(),
+            ),
+            (
                 "docker ps -a".into(),
                 concat!(
                     r#"{"Command":"x","ID":"9d041a65c06e","Image":"amneziavpn/amneziawg-go:latest","Names":"amnezia-legacy-test","State":"running","Status":"Up 3 minutes"}"#,
