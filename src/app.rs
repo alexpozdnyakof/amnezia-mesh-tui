@@ -320,7 +320,26 @@ impl App {
 
     // --- M4: mutations (input, confirm, secret) ---
 
+    pub fn read_only(&self) -> bool {
+        self.server.read_only == Some(true)
+    }
+
+    fn reject_when_read_only(&mut self) -> bool {
+        if self.read_only() {
+            self.mutate_notice(
+                "server is read-only (read_only = true in config)".into(),
+                true,
+            );
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn open_add_input(&mut self) {
+        if self.reject_when_read_only() {
+            return;
+        }
         self.dashboard.notice = None;
         self.dashboard.input = Some(InputState {
             prompt: "add peer — name".to_string(),
@@ -330,6 +349,9 @@ impl App {
     }
 
     pub fn open_rename_input(&mut self) {
+        if self.reject_when_read_only() {
+            return;
+        }
         let Some(peer) = self.selected_peer().cloned() else {
             return;
         };
@@ -385,6 +407,9 @@ impl App {
     }
 
     pub fn request_revoke(&mut self) {
+        if self.reject_when_read_only() {
+            return;
+        }
         let name = self.selected_peer().map(|p| p.name.clone());
         if let Some(name) = name {
             self.dashboard.notice = None;

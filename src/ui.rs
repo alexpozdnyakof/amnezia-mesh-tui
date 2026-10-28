@@ -296,7 +296,11 @@ fn draw_hints(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             Screen::Discovery => " ↑↓ select · Enter inspect · d re-scan · Esc back ",
             Screen::Inspect => " Esc back · q quit ",
             Screen::Dashboard => {
-                " ↑↓ select · a add · r rename · x revoke · l logs · m map · Esc back "
+                if app.read_only() {
+                    " READ-ONLY · ↑↓ select · l logs · m map · Esc back "
+                } else {
+                    " ↑↓ select · a add · r rename · x revoke · l logs · m map · Esc back "
+                }
             }
             Screen::Map => " Esc back · auto-refresh 3s · l logs ",
             Screen::Secret => " s save to ~/Downloads · Esc close (secret cleared) ",

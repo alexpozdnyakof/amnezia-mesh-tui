@@ -23,19 +23,22 @@ pub enum Error {
     Spawn(#[from] std::io::Error),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Transport {
     Ssh(SshTransport),
     Mock(MockTransport),
+    /// Runs commands on the machine the panel itself runs on (the
+    /// `ssh_alias = "local"` convention — e.g. the binary lives on the VPS).
+    Local,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SshTransport {
     pub alias: String,
     pub login_shell: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MockTransport {
     /// Canned stdout per command substring; first match wins.
     pub responses: Vec<(String, String)>,
@@ -43,6 +46,9 @@ pub struct MockTransport {
 
 impl Transport {
     pub fn for_server(server: &ServerConfig) -> Self {
+        if server.ssh_alias == "local" {
+            return Transport::Local;
+        }
         Transport::Ssh(SshTransport {
             alias: server.ssh_alias.clone(),
             login_shell: server.login_shell.clone(),
@@ -55,6 +61,18 @@ impl Transport {
         match self {
             Transport::Ssh(t) => t.exec(cmd).await,
             Transport::Mock(t) => t.exec(cmd).await,
+            Transport::Local => {
+                let out = tokio::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(cmd)
+                    .output()
+                    .await?;
+                Ok(RemoteOutput {
+                    status: out.status.code(),
+                    stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                })
+            }
         }
     }
 }
@@ -275,5 +293,25 @@ mod tests {
     fn shell_quote_wraps_and_escapes() {
         assert_eq!(shell_quote("docker ps -a"), "'docker ps -a'");
         assert_eq!(shell_quote("echo 'a b'"), "'echo '\\''a b'\\'''");
+    }
+}
+
+#[cfg(test)]
+mod for_server_tests {
+    use super::*;
+
+    #[test]
+    fn local_alias_maps_to_local_transport() {
+        let server = ServerConfig {
+            ssh_alias: "local".into(),
+            ..ServerConfig::default()
+        };
+        assert_eq!(Transport::for_server(&server), Transport::Local);
+        let server = ServerConfig {
+            ssh_alias: "vps".into(),
+            login_shell: "bash".into(),
+            ..ServerConfig::default()
+        };
+        assert!(matches!(Transport::for_server(&server), Transport::Ssh(_)));
     }
 }

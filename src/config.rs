@@ -28,6 +28,7 @@ impl Default for ServerConfig {
             mmdb_path: None,
             server_lat: None,
             server_lon: None,
+            read_only: None,
         }
     }
 }
@@ -55,6 +56,10 @@ pub struct ServerConfig {
     pub server_lat: Option<f64>,
     #[serde(default)]
     pub server_lon: Option<f64>,
+    /// Mutations blocked in the UI (e.g. a production server you only
+    /// watch). Read-only screens keep working.
+    #[serde(default)]
+    pub read_only: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
