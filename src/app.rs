@@ -9,9 +9,10 @@ use crate::bootstrap::bootstrap;
 use crate::config::{Config, ServerConfig};
 use crate::docker::{discover, stack_services, ContainerInfo};
 use crate::doctor::{doctor, DoctorReport};
+use crate::geo::{endpoint_ip, GeoDb, GeoInfo};
 use crate::inspect::{inspect, InspectSummary};
 use crate::logs::{fetch_stats_log, fetch_watchdog_log};
-use crate::peers::{fetch_names, resolve_peers, PeerSample, ResolvedPeer};
+use crate::peers::{fetch_names, resolve_peers, PeerSample, PeerStatus, ResolvedPeer};
 use crate::probe::{probe, ProbeResult};
 use crate::show::parse_show;
 use crate::stats::{parse_stats_log, StatsEntry};
@@ -41,6 +42,7 @@ pub enum Screen {
     Discovery,
     Inspect,
     Dashboard,
+    Map,
     Log,
 }
 
@@ -83,6 +85,15 @@ pub struct BootstrapState {
     pub error: Option<String>,
 }
 
+/// Geo-enriched peer row for the connection map (M6).
+#[derive(Debug, Clone)]
+pub struct PeerGeo {
+    pub name: String,
+    pub endpoint_ip: String,
+    pub geo: Option<GeoInfo>,
+    pub status: PeerStatus,
+}
+
 /// Live dashboard state (M2): peers poll, stack services, doctor.
 #[derive(Debug, Default)]
 pub struct DashboardState {
@@ -93,6 +104,7 @@ pub struct DashboardState {
     pub services_error: Option<String>,
     pub doctor: Option<DoctorReport>,
     pub doctor_error: Option<String>,
+    pub geo: Vec<PeerGeo>,
     pub last_peers: Option<Instant>,
     pub last_services: Option<Instant>,
     pub last_doctor: Option<Instant>,
@@ -129,6 +141,8 @@ pub struct App {
     pub bootstrap: BootstrapState,
     pub dashboard: DashboardState,
     pub log: LogState,
+    pub geo_db: Option<GeoDb>,
+    pub geo_error: Option<String>,
     queue: Vec<Job>,
     running: Option<Job>,
 }
@@ -140,6 +154,15 @@ impl App {
         config: Config,
         cfg_path: PathBuf,
     ) -> Self {
+        let geo_path = server
+            .mmdb_path
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(crate::geo::default_mmdb_path);
+        let (geo_db, geo_error) = match GeoDb::load(&geo_path) {
+            Ok(db) => (Some(db), None),
+            Err(e) => (None, Some(e)),
+        };
         App {
             server_name,
             server,
@@ -152,6 +175,8 @@ impl App {
             bootstrap: BootstrapState::default(),
             dashboard: DashboardState::default(),
             log: LogState::default(),
+            geo_db,
+            geo_error,
             queue: vec![Job::Probe],
             running: None,
         }
@@ -252,16 +277,25 @@ impl App {
         if self.running.is_some() {
             return;
         }
-        if self.screen == Screen::Dashboard {
-            if Self::due(self.dashboard.last_peers, PEERS_INTERVAL) {
-                self.request(Job::PollPeers);
+        match self.screen {
+            Screen::Dashboard => {
+                if Self::due(self.dashboard.last_peers, PEERS_INTERVAL) {
+                    self.request(Job::PollPeers);
+                }
+                if Self::due(self.dashboard.last_services, SERVICES_INTERVAL) {
+                    self.request(Job::Services);
+                }
+                if Self::due(self.dashboard.last_doctor, DOCTOR_INTERVAL) {
+                    self.request(Job::Doctor);
+                }
             }
-            if Self::due(self.dashboard.last_services, SERVICES_INTERVAL) {
-                self.request(Job::Services);
+            // Map rides the peers poll; services/doctor stay on the dashboard.
+            Screen::Map => {
+                if Self::due(self.dashboard.last_peers, PEERS_INTERVAL) {
+                    self.request(Job::PollPeers);
+                }
             }
-            if Self::due(self.dashboard.last_doctor, DOCTOR_INTERVAL) {
-                self.request(Job::Doctor);
-            }
+            _ => {}
         }
         if self.screen == Screen::Log
             && self.log.follow
@@ -421,6 +455,26 @@ impl App {
                                 Instant::now(),
                             );
                             a.dashboard.peers_error = None;
+                            a.dashboard.geo = a
+                                .geo_db
+                                .as_ref()
+                                .map(|db| {
+                                    a.dashboard
+                                        .peers
+                                        .iter()
+                                        .filter_map(|p| {
+                                            let ep = p.endpoint.as_deref()?;
+                                            let ip = endpoint_ip(ep)?;
+                                            Some(PeerGeo {
+                                                name: p.name.clone(),
+                                                endpoint_ip: ip.to_string(),
+                                                geo: db.lookup(ip),
+                                                status: p.status,
+                                            })
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
                         }
                         Err(e) => a.dashboard.peers_error = Some(e),
                     }
@@ -512,6 +566,7 @@ mod tests {
             cli_path: "awg-mesh".into(),
             container: "amnezia-legacy-test".into(),
             login_shell: "sh".into(),
+            ..ServerConfig::default()
         };
         let mut config = Config {
             active_server: "mock".into(),

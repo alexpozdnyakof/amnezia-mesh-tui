@@ -18,6 +18,20 @@ fn default_login_shell() -> String {
     DEFAULT_LOGIN_SHELL.to_string()
 }
 
+impl Default for ServerConfig {
+    fn default() -> Self {
+        ServerConfig {
+            ssh_alias: String::new(),
+            cli_path: default_cli_path(),
+            container: default_container(),
+            login_shell: default_login_shell(),
+            mmdb_path: None,
+            server_lat: None,
+            server_lon: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// ssh alias or hostname to connect to (resolved by the user's ssh config).
@@ -32,6 +46,15 @@ pub struct ServerConfig {
     /// PATH of non-interactive ssh sessions).
     #[serde(default = "default_login_shell")]
     pub login_shell: String,
+    /// GeoLite2-City / IP2Location LITE mmdb for the connection map (M6).
+    /// None → map falls back to a text table. Offline only.
+    #[serde(default)]
+    pub mmdb_path: Option<String>,
+    /// Hub coordinates for the map; None → centroid of known peer coords.
+    #[serde(default)]
+    pub server_lat: Option<f64>,
+    #[serde(default)]
+    pub server_lon: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

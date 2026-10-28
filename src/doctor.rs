@@ -74,6 +74,7 @@ mod tests {
             cli_path: "awg-mesh".into(),
             container: "amnezia-mesh-awg".into(),
             login_shell: "sh".into(),
+            ..ServerConfig::default()
         }
     }
 

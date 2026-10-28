@@ -2,18 +2,20 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
+use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
 use ratatui::widgets::{
     Axis, Block, Borders, Cell, Chart, Dataset, GraphType, List, ListItem, ListState, Paragraph,
     Row, Table, Wrap,
 };
 use ratatui::Frame;
 
-use crate::app::{App, LogView, ProbeState, Screen};
+use crate::app::{App, LogView, PeerGeo, ProbeState, Screen};
 use crate::bootstrap::{BOOTSTRAP_DIR, BOOTSTRAP_REPO};
 use crate::chart::{
     downsample, entries_end, presence_heatmap, traffic_series, HeatCell, TrafficPoint,
     BUCKET_MINUTES, HEATMAP_HOURS,
 };
+use crate::geo::{centroid, fit_bounds, geo_label, GeoInfo};
 use crate::logs::STATS_LOG_PATH;
 use crate::peers::{format_age, format_bytes, format_rate, short_pubkey, PeerStatus};
 
@@ -38,6 +40,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::Discovery => draw_discovery(f, app, chunks[1]),
         Screen::Inspect => draw_inspect(f, app, chunks[1]),
         Screen::Dashboard => draw_dashboard(f, app, chunks[1]),
+        Screen::Map => draw_map(f, app, chunks[1]),
         Screen::Log => draw_log(f, app, chunks[1]),
     }
     draw_hints(f, app, chunks[2]);
@@ -284,7 +287,8 @@ fn draw_hints(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             }
             Screen::Discovery => " ↑↓ select · Enter inspect · d re-scan · Esc back ",
             Screen::Inspect => " Esc back · q quit ",
-            Screen::Dashboard => " Esc back · auto-refresh 3s · l logs ",
+            Screen::Dashboard => " Esc back · auto-refresh 3s · l logs · m map ",
+            Screen::Map => " Esc back · auto-refresh 3s · l logs ",
             Screen::Log => unreachable!(),
         };
         s.to_string()
@@ -645,4 +649,170 @@ fn draw_dashboard(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     )
     .header(header);
     f.render_widget(table, chunks[2]);
+}
+
+fn map_status_color(status: PeerStatus) -> Color {
+    match status {
+        PeerStatus::Live => Color::LightGreen,
+        PeerStatus::Stale => Color::Green,
+        PeerStatus::Dead => Color::DarkGray,
+    }
+}
+
+fn draw_map(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(30), Constraint::Length(46)])
+        .split(area);
+
+    let peers_with_geo: Vec<(&PeerGeo, &GeoInfo)> = app
+        .dashboard
+        .geo
+        .iter()
+        .filter_map(|g| g.geo.as_ref().map(|i| (g, i)))
+        .collect();
+    let server_coord = app.server.server_lat.zip(app.server.server_lon);
+    let known: Vec<(f64, f64)> = peers_with_geo.iter().map(|(_, i)| (i.lat, i.lon)).collect();
+    let hub = server_coord.or_else(|| centroid(&known));
+
+    // side panel: hub info, legend, per-peer geo table (fallback view)
+    let mut lines: Vec<Line> = Vec::new();
+    match &hub {
+        Some((lat, lon)) => lines.push(Line::from(vec![
+            Span::styled("hub: ", DIM),
+            Span::styled(format!("{lat:.2}°, {lon:.2}°"), GOOD),
+            Span::styled(
+                if server_coord.is_some() {
+                    " (configured)"
+                } else {
+                    " (centroid of peers)"
+                },
+                DIM,
+            ),
+        ])),
+        None => lines.push(Line::from(Span::styled(
+            "hub: no coordinates yet".to_string(),
+            DIM,
+        ))),
+    }
+    if let Some(e) = &app.geo_error {
+        lines.push(Line::from(Span::styled(format!("geoip: {e}"), WARN)));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("●", Style::default().fg(Color::LightGreen)),
+        Span::styled(" live  ", DIM),
+        Span::styled("●", Style::default().fg(Color::Green)),
+        Span::styled(" stale  ", DIM),
+        Span::styled("●", Style::default().fg(Color::DarkGray)),
+        Span::styled(" dead ", DIM),
+        Span::styled("◉ hub", GOOD),
+    ]));
+    lines.push(Line::from(""));
+    for g in &app.dashboard.geo {
+        let label = g
+            .geo
+            .as_ref()
+            .map(geo_label)
+            .unwrap_or_else(|| "no coords".to_string());
+        lines.push(Line::from(vec![
+            Span::styled("● ", Style::default().fg(map_status_color(g.status))),
+            Span::styled(format!("{:<18} ", g.name), Style::default()),
+            Span::styled(format!("{} ", g.endpoint_ip), DIM),
+            Span::styled(label, DIM),
+        ]));
+    }
+    let panel = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" connections "),
+    );
+    f.render_widget(panel, chunks[1]);
+
+    // canvas map
+    if app.geo_db.is_none() {
+        let hint = Paragraph::new(Span::styled(
+            " geoip db not loaded — put GeoLite2-City.mmdb (or IP2Location \
+             LITE) into the path from the panel, or set mmdb_path in config"
+                .to_string(),
+            WARN,
+        ))
+        .block(Block::default().borders(Borders::ALL).title(" map "));
+        f.render_widget(hint, chunks[0]);
+        return;
+    }
+    if hub.is_none() || peers_with_geo.is_empty() {
+        let hint = Paragraph::new(Span::styled(
+            " no peers with known coordinates yet".to_string(),
+            DIM,
+        ))
+        .block(Block::default().borders(Borders::ALL).title(" map "));
+        f.render_widget(hint, chunks[0]);
+        return;
+    }
+    let hub = hub.expect("checked above");
+    let mut all = known.clone();
+    all.push(hub);
+    let ((lat_min, lat_max), (lon_min, lon_max)) = fit_bounds(&all).expect("non-empty");
+    let canvas = Canvas::default()
+        .marker(symbols::Marker::Braille)
+        .x_bounds([lon_min, lon_max])
+        .y_bounds([lat_min, lat_max])
+        .paint(move |ctx| {
+            // 10° grid for orientation (equirectangular, distortion at
+            // high latitudes is acceptable for an admin overview)
+            let mut lon = (lon_min / 10.0).ceil() * 10.0;
+            while lon <= lon_max {
+                ctx.draw(&CanvasLine {
+                    x1: lon,
+                    y1: lat_min,
+                    x2: lon,
+                    y2: lat_max,
+                    color: Color::Rgb(30, 40, 30),
+                });
+                lon += 10.0;
+            }
+            let mut lat = (lat_min / 10.0).ceil() * 10.0;
+            while lat <= lat_max {
+                ctx.draw(&CanvasLine {
+                    x1: lon_min,
+                    y1: lat,
+                    x2: lon_max,
+                    y2: lat,
+                    color: Color::Rgb(30, 40, 30),
+                });
+                lat += 10.0;
+            }
+            for (_, info) in &peers_with_geo {
+                ctx.draw(&CanvasLine {
+                    x1: hub.1,
+                    y1: hub.0,
+                    x2: info.lon,
+                    y2: info.lat,
+                    color: Color::DarkGray,
+                });
+            }
+            for (g, info) in &peers_with_geo {
+                ctx.print(
+                    info.lon,
+                    info.lat,
+                    Span::styled("●", Style::default().fg(map_status_color(g.status))),
+                );
+            }
+            ctx.print(
+                hub.1,
+                hub.0,
+                Span::styled(
+                    "◉",
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            );
+        })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" connection map · hub-and-spoke "),
+        );
+    f.render_widget(canvas, chunks[0]);
 }

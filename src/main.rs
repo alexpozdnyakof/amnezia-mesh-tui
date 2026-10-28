@@ -4,6 +4,7 @@ mod chart;
 mod config;
 mod docker;
 mod doctor;
+mod geo;
 mod inspect;
 mod logs;
 mod peers;
@@ -366,8 +367,14 @@ async fn handle_key(app: &Arc<Mutex<App>>, key: KeyEvent) -> bool {
         Screen::Dashboard => match key.code {
             KeyCode::Esc => a.screen = Screen::Preflight,
             KeyCode::Char('l') => a.enter_log(Screen::Dashboard),
+            KeyCode::Char('m') => a.screen = Screen::Map,
             _ => {}
         },
+        Screen::Map => {
+            if key.code == KeyCode::Esc {
+                a.screen = Screen::Dashboard;
+            }
+        }
         Screen::Log => match key.code {
             KeyCode::Esc => a.screen = a.log.return_to.unwrap_or(Screen::Preflight),
             KeyCode::Char('f') => {
