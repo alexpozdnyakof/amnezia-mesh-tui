@@ -62,11 +62,7 @@ impl Transport {
             Transport::Ssh(t) => t.exec(cmd).await,
             Transport::Mock(t) => t.exec(cmd).await,
             Transport::Local => {
-                let out = tokio::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(cmd)
-                    .output()
-                    .await?;
+                let out = local_command(cmd).output().await?;
                 Ok(RemoteOutput {
                     status: out.status.code(),
                     stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -75,25 +71,110 @@ impl Transport {
             }
         }
     }
+
+    /// Same as `exec`, but each stdout/stderr line is handed to `on_line`
+    /// as it arrives. Used by init/adopt, which run for minutes. Stdin is
+    /// closed so a remote prompt cannot eat TUI keypresses.
+    pub async fn exec_lines(
+        &self,
+        cmd: &str,
+        on_line: impl FnMut(String),
+    ) -> Result<RemoteOutput, Error> {
+        match self {
+            Transport::Ssh(t) => stream_child(t.command(cmd), on_line).await,
+            Transport::Local => stream_child(local_command(cmd), on_line).await,
+            Transport::Mock(t) => t.exec_lines(cmd, on_line).await,
+        }
+    }
+}
+
+fn local_command(cmd: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("sh");
+    command.arg("-c").arg(cmd);
+    command
+}
+
+async fn stream_child(
+    mut command: tokio::process::Command,
+    mut on_line: impl FnMut(String),
+) -> Result<RemoteOutput, Error> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let mut out_lines = BufReader::new(stdout).lines();
+    let mut err_lines = BufReader::new(stderr).lines();
+    let mut out_open = true;
+    let mut err_open = true;
+    let mut buf = String::new();
+    while out_open || err_open {
+        tokio::select! {
+            biased;
+            line = out_lines.next_line(), if out_open => {
+                match line {
+                    Ok(Some(l)) => {
+                        on_line(l.clone());
+                        buf.push_str(&l);
+                        buf.push('\n');
+                    }
+                    Ok(None) => out_open = false,
+                    Err(e) => {
+                        on_line(format!("(read error: {e})"));
+                        out_open = false;
+                    }
+                }
+            }
+            line = err_lines.next_line(), if err_open => {
+                match line {
+                    Ok(Some(l)) => {
+                        on_line(l.clone());
+                        buf.push_str(&l);
+                        buf.push('\n');
+                    }
+                    Ok(None) => err_open = false,
+                    Err(e) => {
+                        on_line(format!("(read error: {e})"));
+                        err_open = false;
+                    }
+                }
+            }
+        }
+    }
+    let status = child.wait().await?;
+    Ok(RemoteOutput {
+        status: status.code(),
+        stdout: buf,
+        stderr: String::new(),
+    })
 }
 
 impl SshTransport {
-    pub async fn exec(&self, cmd: &str) -> Result<RemoteOutput, Error> {
+    fn command(&self, cmd: &str) -> tokio::process::Command {
         // BatchMode: never hang on an interactive password prompt; the panel
         // must fail visibly instead. Login-shell wrapper: docker commonly
         // lives outside the non-interactive PATH (found on the colima stand).
         let remote = format!("{} -lc {}", self.login_shell, shell_quote(cmd));
-        let out = tokio::process::Command::new("ssh")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=8",
-                &self.alias,
-                &remote,
-            ])
-            .output()
-            .await?;
+        let mut command = tokio::process::Command::new("ssh");
+        command.args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            &self.alias,
+            &remote,
+        ]);
+        command
+    }
+
+    pub async fn exec(&self, cmd: &str) -> Result<RemoteOutput, Error> {
+        let out = self.command(cmd).output().await?;
         Ok(RemoteOutput {
             status: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -103,21 +184,63 @@ impl SshTransport {
 }
 
 impl MockTransport {
+    fn canned<'a>(&'a self, cmd: &str) -> Option<&'a str> {
+        self.responses
+            .iter()
+            .find(|(needle, _)| cmd.contains(needle))
+            .map(|(_, stdout)| stdout.as_str())
+    }
+
     pub async fn exec(&self, cmd: &str) -> Result<RemoteOutput, Error> {
-        for (needle, stdout) in &self.responses {
-            if cmd.contains(needle) {
-                return Ok(RemoteOutput {
-                    status: Some(0),
-                    stdout: stdout.clone(),
-                    stderr: String::new(),
-                });
-            }
+        match self.canned(cmd) {
+            Some(stdout) => Ok(RemoteOutput {
+                status: Some(0),
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            }),
+            None => Ok(RemoteOutput {
+                status: Some(127),
+                stdout: String::new(),
+                stderr: format!("mock: no canned response for: {cmd}"),
+            }),
         }
-        Ok(RemoteOutput {
-            status: Some(127),
-            stdout: String::new(),
-            stderr: format!("mock: no canned response for: {cmd}"),
-        })
+    }
+
+    /// A canned body may start with `__EXIT__:N\n` to simulate a non-zero
+    /// status. `exec` leaves that prefix intact; only the streaming path
+    /// (init/adopt) interprets it.
+    pub async fn exec_lines(
+        &self,
+        cmd: &str,
+        mut on_line: impl FnMut(String),
+    ) -> Result<RemoteOutput, Error> {
+        let mut out = self.exec(cmd).await?;
+        if out.status != Some(0) {
+            return Ok(out);
+        }
+        let raw = std::mem::take(&mut out.stdout);
+        let (status, body) = split_status_prefix(&raw);
+        if let Some(code) = status {
+            out.status = Some(code);
+        }
+        for line in body.lines() {
+            on_line(line.to_string());
+        }
+        out.stdout = body.to_string();
+        Ok(out)
+    }
+}
+
+fn split_status_prefix(stdout: &str) -> (Option<i32>, &str) {
+    let Some(rest) = stdout.strip_prefix("__EXIT__:") else {
+        return (None, stdout);
+    };
+    let Some((code, body)) = rest.split_once('\n') else {
+        return (None, stdout);
+    };
+    match code.parse::<i32>() {
+        Ok(n) => (Some(n), body),
+        Err(_) => (None, stdout),
     }
 }
 
@@ -275,13 +398,22 @@ pub fn mock_canned() -> Transport {
                     "warnings":["peer xyz has no usable name comment"]}}"#
                     .into(),
             ),
+            ("ifconfig.me".into(), "203.0.113.10\n".into()),
+            (
+                " init --host ".into(),
+                "pulling image amneziavpn/amneziawg-go:latest ...\namnezia-mesh is up.\n".into(),
+            ),
+            (
+                " adopt --container ".into(),
+                "stopping 'amnezia-legacy-test' (kept stopped for rollback — do not remove) ...\nadopt complete: 3 peers carried over, IPs and keys unchanged\n".into(),
+            ),
         ],
     })
 }
 
 /// POSIX single-quote escaping for embedding `cmd` into the remote
 /// "shell -lc '<cmd>'" invocation.
-fn shell_quote(cmd: &str) -> String {
+pub(crate) fn shell_quote(cmd: &str) -> String {
     format!("'{}'", cmd.replace('\'', "'\\''"))
 }
 
@@ -299,6 +431,24 @@ mod tests {
 #[cfg(test)]
 mod for_server_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn exec_lines_strips_exit_prefix_and_emits_lines() {
+        let t = Transport::Mock(MockTransport {
+            responses: vec![(
+                "init --host".into(),
+                "__EXIT__:1\nfirst\nrolled back, x is running again\n".into(),
+            )],
+        });
+        let mut lines = Vec::new();
+        let out = t
+            .exec_lines("awg-mesh init --host 1", |l| lines.push(l))
+            .await
+            .unwrap();
+        assert_eq!(out.status, Some(1));
+        assert_eq!(lines, vec!["first", "rolled back, x is running again"]);
+        assert!(!out.stdout.contains("__EXIT__"));
+    }
 
     #[test]
     fn local_alias_maps_to_local_transport() {

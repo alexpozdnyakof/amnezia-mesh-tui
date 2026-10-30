@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
+use zeroize::Zeroize;
 
 use crate::bootstrap::bootstrap;
 use crate::config::{Config, ServerConfig};
@@ -15,10 +16,34 @@ use crate::logs::{fetch_stats_log, fetch_watchdog_log};
 use crate::mutate::{self, MutateError, PeerAdded};
 use crate::peers::{fetch_names, resolve_peers, PeerSample, PeerStatus, ResolvedPeer};
 use crate::probe::{probe, ProbeResult};
+use crate::profile::{self, ProfileView};
 use crate::show::parse_show;
 use crate::stats::{parse_stats_log, StatsEntry};
 use crate::transport::Transport;
 use crate::watchdog::{parse_watchdog_log, WatchdogEvent};
+use crate::wizard::{self, Form, RunOutcome};
+
+const READ_ONLY_MSG: &str = "server is read-only (read_only = true in config)";
+const RUN_CAP: usize = 400;
+
+fn downloads_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let dir = PathBuf::from(home).join("Downloads");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+fn file_stem(name: &str) -> String {
+    let stem: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if stem.is_empty() {
+        "peer".to_string()
+    } else {
+        stem
+    }
+}
 
 const PEERS_INTERVAL: Duration = Duration::from_secs(3);
 const SERVICES_INTERVAL: Duration = Duration::from_secs(10);
@@ -36,6 +61,8 @@ pub enum Job {
     Doctor,
     FetchLog,
     Mutate(Mutation),
+    DetectHost,
+    Provision,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -54,6 +81,8 @@ pub enum Screen {
     Map,
     Log,
     Secret,
+    Wizard,
+    Run,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -144,18 +173,75 @@ pub struct InputState {
 }
 
 /// Freshly issued key material (M4). Shown once, zeroized on close.
+/// `view` is the public summary only — the private key stays in `profile`.
 #[derive(Debug)]
 pub struct SecretState {
     pub name: String,
     pub ip: String,
     pub profile: String,
     pub saved_to: Option<String>,
+    pub view: Option<ProfileView>,
+    pub qr_saved: Option<String>,
+    pub qr_error: Option<String>,
+}
+
+impl SecretState {
+    pub(crate) fn issued(name: String, ip: String, profile: String) -> Self {
+        let view = profile::find_vpn_url(&profile)
+            .and_then(|url| profile::decode_profile(url).ok())
+            .as_ref()
+            .map(profile::summarize);
+        Self {
+            name,
+            ip,
+            profile,
+            saved_to: None,
+            view,
+            qr_saved: None,
+            qr_error: None,
+        }
+    }
 }
 
 impl Drop for SecretState {
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.profile.zeroize();
+    }
+}
+
+/// Init/adopt form (M1). `return_to` is where Esc lands.
+#[derive(Debug)]
+pub struct WizardView {
+    pub form: Form,
+    pub return_to: Screen,
+}
+
+/// Live init/adopt transcript.
+#[derive(Debug)]
+pub struct RunState {
+    pub title: String,
+    pub cmd: String,
+    pub lines: Vec<String>,
+    pub running: bool,
+    pub outcome: Option<RunOutcome>,
+    pub scroll: usize,
+    pub follow: bool,
+    pub return_to: Screen,
+}
+
+impl Default for RunState {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            cmd: String::new(),
+            lines: Vec::new(),
+            running: false,
+            outcome: None,
+            scroll: 0,
+            follow: true,
+            return_to: Screen::Preflight,
+        }
     }
 }
 
@@ -193,6 +279,8 @@ pub struct App {
     pub geo_db: Option<GeoDb>,
     pub geo_error: Option<String>,
     pub secret: Option<SecretState>,
+    pub wizard: WizardView,
+    pub run: RunState,
     queue: Vec<Job>,
     running: Option<Job>,
 }
@@ -228,6 +316,11 @@ impl App {
             geo_db,
             geo_error,
             secret: None,
+            wizard: WizardView {
+                form: Form::init(),
+                return_to: Screen::Preflight,
+            },
+            run: RunState::default(),
             queue: vec![Job::Probe],
             running: None,
         }
@@ -326,13 +419,109 @@ impl App {
 
     fn reject_when_read_only(&mut self) -> bool {
         if self.read_only() {
-            self.mutate_notice(
-                "server is read-only (read_only = true in config)".into(),
-                true,
-            );
+            self.mutate_notice(READ_ONLY_MSG.into(), true);
             true
         } else {
             false
+        }
+    }
+
+    pub fn open_init_wizard(&mut self) {
+        if self.read_only() {
+            self.bootstrap.error = Some(READ_ONLY_MSG.into());
+            return;
+        }
+        self.wizard = WizardView {
+            form: Form::init(),
+            return_to: Screen::Preflight,
+        };
+        self.screen = Screen::Wizard;
+        self.request(Job::DetectHost);
+    }
+
+    pub fn open_adopt_wizard(&mut self) {
+        if self.inspect.summary.is_none() || self.inspect.container.is_empty() {
+            return;
+        }
+        if self.read_only() {
+            self.inspect.error = Some(READ_ONLY_MSG.into());
+            return;
+        }
+        self.wizard = WizardView {
+            form: Form::adopt(self.inspect.container.clone()),
+            return_to: Screen::Inspect,
+        };
+        self.screen = Screen::Wizard;
+        self.request(Job::DetectHost);
+    }
+
+    /// First `r` arms the confirmation; the second builds the command and runs it.
+    pub fn arm_provision(&mut self) {
+        if self.read_only() {
+            self.wizard.form.error = Some(READ_ONLY_MSG.into());
+            return;
+        }
+        self.wizard.form.editing = false;
+        let cmd = match wizard::build_command(&self.server.cli_path, &self.wizard.form) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                self.wizard.form.error = Some(e);
+                self.wizard.form.confirm_pending = false;
+                return;
+            }
+        };
+        if !self.wizard.form.confirm_pending {
+            self.wizard.form.confirm_pending = true;
+            self.wizard.form.error = None;
+            return;
+        }
+        self.wizard.form.confirm_pending = false;
+        self.run = RunState {
+            title: self.wizard.form.kind.title(),
+            cmd: cmd.clone(),
+            lines: vec![format!("$ {cmd}")],
+            running: true,
+            outcome: None,
+            scroll: 0,
+            follow: true,
+            return_to: self.wizard.return_to,
+        };
+        self.screen = Screen::Run;
+        self.request(Job::Provision);
+    }
+
+    pub fn push_run_line(&mut self, line: String) {
+        self.run.lines.push(line);
+        if self.run.lines.len() > RUN_CAP {
+            let extra = self.run.lines.len() - RUN_CAP;
+            self.run.lines.drain(0..extra);
+            self.run.scroll = self.run.scroll.saturating_sub(extra);
+        }
+        if self.run.follow {
+            self.run.scroll = self.run.lines.len().saturating_sub(1);
+        }
+    }
+
+    pub fn scroll_run(&mut self, delta: isize) {
+        self.run.follow = false;
+        let len = self.run.lines.len() as isize;
+        let s = (self.run.scroll as isize + delta).clamp(0, (len - 1).max(0));
+        self.run.scroll = s as usize;
+    }
+
+    fn note_stack_container(&mut self) {
+        self.server.container = crate::config::DEFAULT_CONTAINER.to_string();
+        let name = self.server_name.clone();
+        if let Some(server) = self.config.servers.get_mut(&name) {
+            server.container = self.server.container.clone();
+        }
+        if let Err(e) = self.config.save(&self.cfg_path) {
+            self.push_run_line(format!("stack is up; config not saved: {e}"));
+        } else {
+            self.push_run_line(format!(
+                "dashboard watches container {}",
+                self.server.container
+            ));
         }
     }
 
@@ -417,6 +606,39 @@ impl App {
         }
     }
 
+    /// `c` on the dashboard. The selected silent peer opens the existing
+    /// confirm. Otherwise jump to the next candidate. A peer that has never
+    /// handshaken is not a candidate.
+    pub fn revoke_candidate_key(&mut self) {
+        if self.reject_when_read_only() {
+            return;
+        }
+        let n = self.dashboard.peers.len();
+        if n == 0 {
+            self.mutate_notice("no peer has been silent for 14 days".into(), false);
+            return;
+        }
+        let sel = self.dashboard.selected.min(n - 1);
+        if self.dashboard.peers[sel].revoke_candidate {
+            self.request_revoke();
+            return;
+        }
+        let next = (1..n)
+            .map(|off| (sel + off) % n)
+            .find(|&i| self.dashboard.peers[i].revoke_candidate);
+        match next {
+            Some(i) => {
+                let name = self.dashboard.peers[i].name.clone();
+                self.dashboard.selected = i;
+                self.mutate_notice(
+                    format!("{name} has been silent for 14 days — c revokes"),
+                    false,
+                );
+            }
+            None => self.mutate_notice("no peer has been silent for 14 days".into(), false),
+        }
+    }
+
     pub fn cancel_revoke(&mut self) {
         self.dashboard.confirm = None;
     }
@@ -438,6 +660,65 @@ impl App {
     pub fn mark_secret_saved(&mut self, path: String) {
         if let Some(s) = &mut self.secret {
             s.saved_to = Some(path);
+        }
+    }
+
+    pub fn save_secret_vpn(&mut self) {
+        let Some(dir) = downloads_dir() else {
+            return;
+        };
+        let written = {
+            let Some(secret) = &self.secret else {
+                return;
+            };
+            let path = dir.join(format!("{}.vpn", file_stem(&secret.name)));
+            std::fs::write(&path, secret.profile.as_bytes())
+                .ok()
+                .map(|_| path.display().to_string())
+        };
+        if let Some(shown) = written {
+            self.mark_secret_saved(shown);
+        }
+    }
+
+    pub fn save_secret_qr(&mut self) {
+        let extracted = self.secret.as_ref().map(|secret| {
+            (
+                profile::find_vpn_url(&secret.profile).map(str::to_string),
+                file_stem(&secret.name),
+            )
+        });
+        let Some((url, stem)) = extracted else {
+            return;
+        };
+        let Some(mut url) = url else {
+            if let Some(secret) = &mut self.secret {
+                secret.qr_error = Some("no vpn:// link in this profile".into());
+            }
+            return;
+        };
+        let Some(dir) = downloads_dir() else {
+            url.zeroize();
+            if let Some(secret) = &mut self.secret {
+                secret.qr_error = Some("could not create ~/Downloads".into());
+            }
+            return;
+        };
+        let path = dir.join(format!("{stem}-qr.png"));
+        let written = profile::write_qr_png(&url, &path);
+        url.zeroize();
+        match written {
+            Ok(()) => {
+                if let Some(secret) = &mut self.secret {
+                    secret.qr_saved = Some(path.display().to_string());
+                    secret.qr_error = None;
+                }
+            }
+            Err(e) => {
+                if let Some(secret) = &mut self.secret {
+                    secret.qr_error = Some(e.to_string());
+                }
+            }
         }
     }
 
@@ -734,13 +1015,11 @@ impl App {
                     match outcome {
                         Ok(Outcome::Added(added, profile)) => {
                             a.mutate_notice(format!("added {} → {}", added.name, added.ip), false);
-                            a.secret = Some(SecretState {
-                                name: added.name,
-                                ip: added.ip,
-                                profile: profile
-                                    .unwrap_or_else(|| "<profile unavailable>".to_string()),
-                                saved_to: None,
-                            });
+                            a.secret = Some(SecretState::issued(
+                                added.name,
+                                added.ip,
+                                profile.unwrap_or_else(|| "<profile unavailable>".to_string()),
+                            ));
                             a.screen = Screen::Secret;
                         }
                         Ok(Outcome::Renamed(old, new)) => {
@@ -791,6 +1070,89 @@ impl App {
                         Err(e) => a.log.error = Some(e),
                     }
                 }
+                Job::DetectHost => {
+                    let force = handle.lock().await.wizard.form.detect_force;
+                    let out = transport.exec(wizard::DETECT_HOST_CMD).await;
+                    let mut a = handle.lock().await;
+                    a.wizard.form.detect_force = false;
+                    match out {
+                        Ok(output) if output.ok() => {
+                            let applied = if force {
+                                a.wizard.form.force_host(output.stdout_trimmed())
+                            } else {
+                                a.wizard.form.apply_detected_host(output.stdout_trimmed())
+                            };
+                            if force && !applied {
+                                a.wizard.form.error =
+                                    Some("could not detect a public address".into());
+                            }
+                        }
+                        Ok(_) if force => {
+                            a.wizard.form.error = Some("could not detect a public address".into());
+                        }
+                        Err(e) if force => a.wizard.form.error = Some(e.to_string()),
+                        _ => {}
+                    }
+                }
+                Job::Provision => {
+                    let cmd = handle.lock().await.run.cmd.clone();
+                    if cmd.is_empty() {
+                        let mut a = handle.lock().await;
+                        a.push_run_line("internal: empty command".into());
+                        a.run.outcome = Some(RunOutcome::Failed);
+                        a.run.running = false;
+                    } else {
+                        // Lines arrive on a channel so the UI can repaint while
+                        // the CLI is still running. A blocking lock here panics:
+                        // this task is already on the tokio runtime.
+                        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                        let mut exec = std::pin::pin!(transport.exec_lines(&cmd, move |line| {
+                            let _ = tx.send(line);
+                        }));
+                        let mut result = None;
+                        loop {
+                            tokio::select! {
+                                biased;
+                                line = rx.recv() => {
+                                    match line {
+                                        Some(line) => handle.lock().await.push_run_line(line),
+                                        None => {
+                                            if result.is_none() {
+                                                result = Some((&mut exec).await);
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                                res = &mut exec, if result.is_none() => {
+                                    result = Some(res);
+                                    while let Ok(line) = rx.try_recv() {
+                                        handle.lock().await.push_run_line(line);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        let result = result.expect("provision exec finished");
+                        let mut a = handle.lock().await;
+                        match result {
+                            Ok(output) => {
+                                let log = a.run.lines.join("\n");
+                                let outcome = wizard::classify(output.status, &log);
+                                a.run.outcome = Some(outcome);
+                                if outcome == RunOutcome::Success {
+                                    a.note_stack_container();
+                                }
+                            }
+                            Err(e) => {
+                                a.push_run_line(e.to_string());
+                                a.run.outcome = Some(RunOutcome::Failed);
+                            }
+                        }
+                        a.run.running = false;
+                        a.run.follow = false;
+                    }
+                }
             }
             let mut a = handle.lock().await;
             a.running = None;
@@ -803,8 +1165,9 @@ impl App {
             Job::Discover => self.discovery.running = running,
             Job::Inspect(_) => self.inspect.running = running,
             Job::Bootstrap => self.bootstrap.running = running,
-            Job::PollPeers | Job::Services | Job::Doctor | Job::FetchLog => {}
+            Job::PollPeers | Job::Services | Job::Doctor | Job::FetchLog | Job::DetectHost => {}
             Job::Mutate(_) => {}
+            Job::Provision => self.run.running = running,
         }
     }
 }
@@ -871,5 +1234,154 @@ mod tests {
         assert_eq!(app.log.filter.as_deref(), Some("P2"));
         app.cycle_peer_filter();
         assert_eq!(app.log.filter, None);
+    }
+
+    #[tokio::test]
+    async fn provision_success_points_dashboard_at_stack_container() {
+        let path = std::env::temp_dir().join(format!(
+            "awg-mesh-tui-provision-{}.toml",
+            std::process::id()
+        ));
+        let app = Arc::new(Mutex::new(test_app()));
+        {
+            let mut a = app.lock().await;
+            a.cfg_path = path.clone();
+            let mut form = Form::init();
+            form.set_field(wizard::FieldId::Host, "203.0.113.10");
+            let cmd = wizard::build_command("awg-mesh", &form).unwrap();
+            a.run = RunState {
+                title: form.kind.title(),
+                cmd,
+                lines: Vec::new(),
+                running: true,
+                outcome: None,
+                scroll: 0,
+                follow: true,
+                return_to: Screen::Preflight,
+            };
+            a.request(Job::Provision);
+        }
+        let transport = mock_canned();
+        for _ in 0..80 {
+            App::pump(&app, &transport).await;
+            if app.lock().await.run.outcome.is_some() && app.lock().await.running.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let a = app.lock().await;
+        assert_eq!(a.run.outcome, Some(RunOutcome::Success));
+        assert!(
+            a.run.lines.iter().any(|l| l.contains("amnezia-mesh is up")),
+            "lines: {:?}",
+            a.run.lines
+        );
+        assert_eq!(a.server.container, "amnezia-mesh-awg");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn provision_rollback_keeps_the_old_container() {
+        let app = Arc::new(Mutex::new(test_app()));
+        {
+            let mut a = app.lock().await;
+            a.run = RunState {
+                title: "adopt".into(),
+                cmd: "AWG_MESH_NONINTERACTIVE=1 awg-mesh adopt --container legacy --host 203.0.113.10".into(),
+                lines: Vec::new(),
+                running: true,
+                outcome: None,
+                scroll: 0,
+                follow: true,
+                return_to: Screen::Inspect,
+            };
+            a.request(Job::Provision);
+        }
+        let transport = Transport::Mock(crate::transport::MockTransport {
+            responses: vec![(
+                "adopt --container".into(),
+                "__EXIT__:1\npost-adopt checks failed — rolled back, 'legacy' is running again\n"
+                    .into(),
+            )],
+        });
+        for _ in 0..80 {
+            App::pump(&app, &transport).await;
+            if app.lock().await.run.outcome.is_some() && app.lock().await.running.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let a = app.lock().await;
+        assert_eq!(a.run.outcome, Some(RunOutcome::RolledBack));
+        assert_eq!(a.server.container, "amnezia-legacy-test");
+        assert!(a.run.lines.iter().any(|l| l.contains("rolled back")));
+    }
+
+    fn row(name: &str, candidate: bool) -> ResolvedPeer {
+        ResolvedPeer {
+            name: name.into(),
+            ip: "100.64.0.8".into(),
+            pubkey: name.into(),
+            status: if candidate {
+                PeerStatus::Dead
+            } else {
+                PeerStatus::Live
+            },
+            handshake: Some(Duration::from_secs(if candidate { 14 * 86400 } else { 30 })),
+            endpoint: None,
+            rx_rate: 0.0,
+            tx_rate: 0.0,
+            revoke_candidate: candidate,
+        }
+    }
+
+    #[test]
+    fn c_key_jumps_to_a_silent_peer_then_asks_to_confirm() {
+        let mut app = test_app();
+        app.dashboard.peers = vec![row("fresh", false), row("gone", true), row("also", true)];
+        app.dashboard.selected = 0;
+        app.revoke_candidate_key();
+        assert_eq!(app.dashboard.selected, 1);
+        assert!(app.dashboard.confirm.is_none());
+        let (msg, err) = app.dashboard.notice.clone().unwrap();
+        assert!(!err);
+        assert!(msg.contains("gone"));
+        app.revoke_candidate_key();
+        assert_eq!(app.dashboard.confirm.as_deref(), Some("gone"));
+
+        app.dashboard.confirm = None;
+        app.dashboard.selected = 2;
+        app.revoke_candidate_key();
+        assert_eq!(app.dashboard.confirm.as_deref(), Some("also"));
+    }
+
+    #[test]
+    fn c_key_wraps_and_stays_quiet_when_nobody_is_silent() {
+        let mut app = test_app();
+        app.dashboard.peers = vec![row("gone", true), row("fresh", false)];
+        app.dashboard.selected = 1;
+        app.revoke_candidate_key();
+        assert_eq!(app.dashboard.selected, 0);
+        assert!(app.dashboard.confirm.is_none());
+
+        app.dashboard.peers = vec![row("fresh", false)];
+        app.dashboard.selected = 0;
+        app.revoke_candidate_key();
+        assert_eq!(
+            app.dashboard.notice.as_ref().map(|(m, _)| m.as_str()),
+            Some("no peer has been silent for 14 days")
+        );
+        assert!(app.dashboard.confirm.is_none());
+    }
+
+    #[test]
+    fn c_key_on_a_read_only_server_does_not_confirm() {
+        let mut app = test_app();
+        app.server.read_only = Some(true);
+        app.dashboard.peers = vec![row("gone", true)];
+        app.revoke_candidate_key();
+        assert!(app.dashboard.confirm.is_none());
+        let (_, err) = app.dashboard.notice.unwrap();
+        assert!(err);
     }
 }

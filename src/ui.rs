@@ -15,9 +15,15 @@ use crate::chart::{
     downsample, entries_end, presence_heatmap, traffic_series, HeatCell, TrafficPoint,
     BUCKET_MINUTES, HEATMAP_HOURS,
 };
+use crate::docker::ContainerInfo;
+use crate::doctor::DoctorCheck;
 use crate::geo::{centroid, fit_bounds, geo_label, GeoInfo};
 use crate::logs::STATS_LOG_PATH;
-use crate::peers::{format_age, format_bytes, format_rate, short_pubkey, PeerStatus};
+use crate::peers::{
+    format_age, format_bytes, format_rate, short_pubkey, PeerStatus, ResolvedPeer, REVOKE_AFTER,
+};
+use crate::profile;
+use crate::wizard::{FieldKind, RunOutcome};
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const GOOD: Style = Style::new().fg(Color::Green);
@@ -43,12 +49,14 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::Map => draw_map(f, app, chunks[1]),
         Screen::Log => draw_log(f, app, chunks[1]),
         Screen::Secret => draw_secret(f, app, chunks[1]),
+        Screen::Wizard => draw_wizard(f, app, chunks[1]),
+        Screen::Run => draw_run(f, app, chunks[1]),
     }
     draw_hints(f, app, chunks[2]);
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let title = Paragraph::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             " awg-mesh-tui ",
             Style::default()
@@ -56,11 +64,35 @@ fn draw_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            " server: {} (ssh: {}) ",
-            app.server_name, app.server.ssh_alias
+            " {} · server: {} (ssh: {}) ",
+            screen_label(app.screen),
+            app.server_name,
+            app.server.ssh_alias
         )),
-    ]));
-    f.render_widget(title, area);
+    ];
+    if app.read_only() {
+        spans.push(Span::styled(
+            " read-only ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn screen_label(screen: Screen) -> &'static str {
+    match screen {
+        Screen::Preflight => "preflight",
+        Screen::Discovery => "discovery",
+        Screen::Inspect => "inspect",
+        Screen::Dashboard => "dashboard",
+        Screen::Map => "map",
+        Screen::Log => "logs",
+        Screen::Secret => "key",
+        Screen::Wizard => "setup",
+        Screen::Run => "run",
+    }
 }
 
 fn draw_preflight(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -245,6 +277,11 @@ fn draw_inspect(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             for w in &s.warnings {
                 text.push(Line::from(Span::styled(format!("warning: {w}"), WARN)));
             }
+            text.push(Line::from(""));
+            text.push(Line::from(Span::styled(
+                "preview only — the container is unchanged. a opens the adopt form.",
+                WARN,
+            )));
         }
         None => {
             if let Some(e) = &i.error {
@@ -257,6 +294,108 @@ fn draw_inspect(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     let body = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
     f.render_widget(body, area);
+}
+
+fn draw_wizard(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let form = &app.wizard.form;
+    let mut lines = Vec::new();
+    if let crate::wizard::Kind::Adopt { container } = &form.kind {
+        lines.push(Line::from(vec![
+            Span::styled("container  ", DIM),
+            Span::raw(container.clone()),
+            Span::styled("   stopped during adopt, kept for rollback", DIM),
+        ]));
+        lines.push(Line::from(""));
+    }
+    for (i, field) in form.fields.iter().enumerate() {
+        let marker = if i == form.selected { "> " } else { "  " };
+        let value = match field.kind {
+            FieldKind::Toggle => field.value.clone(),
+            FieldKind::Text if form.editing && i == form.selected => format!("{}_", field.value),
+            FieldKind::Text if field.value.is_empty() => "—".to_string(),
+            FieldKind::Text => field.value.clone(),
+        };
+        let style = if i == form.selected {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, GOOD),
+            Span::styled(format!("{:<12}", field.label), DIM),
+            Span::styled(value, style),
+        ]));
+    }
+    if let Some(err) = &form.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(format!("error: {err}"), BAD)));
+    }
+    if form.confirm_pending {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(form.confirm_hint(), WARN)));
+    }
+    let body = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} ", form.kind.title())),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(body, area);
+}
+
+fn draw_run(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let run = &app.run;
+    let (suffix, color) = match run.outcome {
+        None if run.running => ("live", Color::Cyan),
+        None => ("waiting", Color::DarkGray),
+        Some(RunOutcome::Success) => ("up", Color::Green),
+        Some(RunOutcome::RolledBack) => ("rolled back", Color::Yellow),
+        Some(RunOutcome::Failed) => ("failed", Color::Red),
+    };
+    let banner = run.outcome.map(|outcome| {
+        let (text, style) = match outcome {
+            RunOutcome::Success => ("amnezia-mesh is up. Enter opens the dashboard.", GOOD),
+            RunOutcome::RolledBack => (
+                "Adopt rolled back. The previous container is running again; nothing was deleted.",
+                WARN,
+            ),
+            RunOutcome::Failed => (
+                "The CLI stopped with an error. Details are in the log.",
+                BAD,
+            ),
+        };
+        Paragraph::new(Span::styled(text, style)).block(Block::default().borders(Borders::ALL))
+    });
+    let chunks = if banner.is_some() {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(3)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3)])
+            .split(area)
+    };
+    if let Some(banner) = banner {
+        f.render_widget(banner, chunks[0]);
+    }
+    let log_area = *chunks.last().unwrap_or(&area);
+    let height = log_area.height.saturating_sub(2) as usize;
+    let end = (run.scroll + 1).min(run.lines.len());
+    let start = end.saturating_sub(height.max(1));
+    let body: Vec<Line> = run.lines[start..end]
+        .iter()
+        .map(|line| Line::from(line.as_str()))
+        .collect();
+    let log = Paragraph::new(body)
+        .block(Block::default().borders(Borders::ALL).title(Span::styled(
+            format!(" {} · {suffix} ", run.title),
+            Style::default().fg(color),
+        )))
+        .wrap(Wrap { trim: false });
+    f.render_widget(log, log_area);
 }
 
 fn draw_hints(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -282,6 +421,10 @@ fn draw_hints(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             " {}: {}_ · Enter confirm · Esc cancel ",
             input.prompt, input.value
         )
+    } else if app.screen == Screen::Wizard && app.wizard.form.editing {
+        " type · Enter done · Esc cancel edit ".to_string()
+    } else if app.screen == Screen::Wizard && app.wizard.form.confirm_pending {
+        " r run · Esc cancel ".to_string()
     } else if let Some(name) = &app.dashboard.confirm {
         format!(" revoke {name}? devices lose access · y confirm · any key cancel ")
     } else {
@@ -290,20 +433,36 @@ fn draw_hints(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 if app.bootstrap.confirm_pending {
                     " B confirm bootstrap · Esc cancel "
                 } else {
-                    " q quit · r re-probe · d discover · b bootstrap · g dashboard · l logs "
+                    " q quit · r re-probe · d discover · i init · b bootstrap · g dashboard · l logs "
                 }
             }
             Screen::Discovery => " ↑↓ select · Enter inspect · d re-scan · Esc back ",
-            Screen::Inspect => " Esc back · q quit ",
+            Screen::Inspect => {
+                if app.read_only() {
+                    " READ-ONLY · Esc back "
+                } else if app.inspect.summary.is_some() {
+                    " a adopt · Esc back "
+                } else {
+                    " Esc back "
+                }
+            }
+            Screen::Wizard => {
+                " ↑↓ select · Enter edit · Space toggle · h detect host · r run · Esc back "
+            }
+            Screen::Run => match app.run.outcome {
+                Some(RunOutcome::Success) => " Enter dashboard · ↑↓ scroll · Esc back ",
+                Some(_) => " ↑↓ scroll · Esc back ",
+                None => " running — wait for the CLI ",
+            },
             Screen::Dashboard => {
                 if app.read_only() {
                     " READ-ONLY · ↑↓ select · l logs · m map · Esc back "
                 } else {
-                    " ↑↓ select · a add · r rename · x revoke · l logs · m map · Esc back "
+                    " ↑↓ select · a add · r rename · x revoke · c 14d · l logs · m map · Esc back "
                 }
             }
             Screen::Map => " Esc back · auto-refresh 3s · l logs ",
-            Screen::Secret => " s save to ~/Downloads · Esc close (secret cleared) ",
+            Screen::Secret => " s save .vpn · p save QR · Esc close (secret cleared) ",
             Screen::Log => unreachable!(),
         };
         s.to_string()
@@ -549,134 +708,333 @@ fn draw_log_heat(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
 fn draw_dashboard(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let d = &app.dashboard;
+    let alerts = dashboard_alerts(
+        d.peers_error.as_deref(),
+        d.services_error.as_deref(),
+        d.doctor_error.as_deref(),
+    );
+    let doctor_h = match &d.doctor {
+        Some(report) if !report.failed().is_empty() => 5,
+        Some(_) => 4,
+        None => 3,
+    };
+    let revoke_selected = d
+        .peers
+        .get(d.selected.min(d.peers.len().saturating_sub(1)))
+        .is_some_and(|p| p.revoke_candidate);
+    let detail_h = 3 + u16::from(d.notice.is_some()) + u16::from(revoke_selected);
+    let mut constraints = Vec::new();
+    if !alerts.is_empty() {
+        // One content row per alert, plus the border. A joined line hid
+        // every error after the first on a normal terminal width.
+        constraints.push(Constraint::Length(alerts.len() as u16 + 2));
+    }
+    constraints.extend([
+        Constraint::Length(3),
+        Constraint::Length(doctor_h),
+        Constraint::Min(5),
+        Constraint::Length(detail_h),
+    ]);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(5),
-        ])
+        .constraints(constraints)
         .split(area);
+    let mut i = 0;
+    if !alerts.is_empty() {
+        let lines: Vec<Line> = alerts
+            .iter()
+            .cloned()
+            .map(|text| Line::from(Span::styled(text, BAD)))
+            .collect();
+        f.render_widget(
+            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" error ")),
+            chunks[i],
+        );
+        i += 1;
+    }
 
-    let services = match &d.services_error {
-        Some(e) => Line::from(Span::styled(format!("services: {e}"), BAD)),
-        None if d.services.is_empty() => Line::from(Span::styled(
-            "services: no amnezia-mesh stack containers (not initialized yet?)".to_string(),
-            DIM,
-        )),
-        None => Line::from(
-            d.services
-                .iter()
-                .map(|c| {
-                    Span::styled(
-                        format!(" {}: {} ", c.name, c.status),
-                        if c.running { GOOD } else { WARN },
-                    )
-                })
-                .collect::<Vec<_>>(),
-        ),
+    let services = services_line(&d.services, d.services_error.is_some());
+    f.render_widget(
+        Paragraph::new(services).block(Block::default().borders(Borders::ALL).title(" services ")),
+        chunks[i],
+    );
+    i += 1;
+
+    let doctor_lines = match &d.doctor {
+        Some(report) => {
+            let (top, bottom) = doctor_check_lines(&report.checks);
+            let mut lines = vec![
+                Line::from(check_spans(&top)),
+                Line::from(check_spans(&bottom)),
+            ];
+            let failed = doctor_failures(&report.checks);
+            if !failed.is_empty() {
+                lines.push(Line::from(Span::styled(failed, BAD)));
+            }
+            lines
+        }
+        None => vec![Line::from(Span::styled(
+            if d.doctor_error.is_some() {
+                "unavailable — the error is in the banner"
+            } else {
+                "polling…"
+            },
+            if d.doctor_error.is_some() { WARN } else { DIM },
+        ))],
+    };
+    let ok_n = d.doctor.as_ref().map(|r| r.checks.len()).unwrap_or(0);
+    let bad_n = d.doctor.as_ref().map(|r| r.failed().len()).unwrap_or(0);
+    // A stored report stays on screen when the next poll fails. The title
+    // says so; the banner has the SSH error.
+    let stale = if d.doctor.is_some() && d.doctor_error.is_some() {
+        " · refresh failed"
+    } else {
+        ""
+    };
+    let doctor_title = match &d.doctor {
+        Some(report) if bad_n == 0 && report.ok => format!(" doctor · {ok_n}/{ok_n}{stale} "),
+        Some(_) if bad_n == 0 => format!(" doctor · not ok{stale} "),
+        Some(_) => format!(" doctor · {bad_n} failed{stale} "),
+        None => " doctor ".to_string(),
     };
     f.render_widget(
-        Paragraph::new(services).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" services (amnezia-mesh stack) "),
-        ),
-        chunks[0],
+        Paragraph::new(doctor_lines)
+            .block(Block::default().borders(Borders::ALL).title(doctor_title)),
+        chunks[i],
     );
+    i += 1;
 
-    let mut status_spans = Vec::new();
-    match (&d.doctor, &d.doctor_error) {
-        (Some(report), _) => {
-            let failed = report.failed();
-            if report.ok && failed.is_empty() {
-                status_spans.push(Span::styled(
-                    format!(
-                        " ✓ doctor: {}/{} checks ok ",
-                        report.checks.len(),
-                        report.checks.len()
-                    ),
-                    GOOD,
-                ));
+    if d.peers.is_empty() {
+        let msg = if d.peers_error.is_some() {
+            "peer list unavailable — the error is in the banner"
+        } else if app.read_only() {
+            "no peers yet"
+        } else {
+            "no peers yet — a adds one"
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(msg, DIM)).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" peers — 0 · refresh 3s "),
+            ),
+            chunks[i],
+        );
+    } else {
+        let (live, stale, dead) = peer_counts(&d.peers);
+        let revoke_n = d.peers.iter().filter(|p| p.revoke_candidate).count();
+        let revoke_bit = if revoke_n == 0 {
+            String::new()
+        } else {
+            format!(" · {revoke_n} revoke")
+        };
+        let header = Row::new(["NAME", "IP", "STATUS", "HANDSHAKE", "ENDPOINT", "RX", "TX"])
+            .style(Style::default().fg(Color::DarkGray));
+        let rows = d.peers.iter().map(|p| {
+            let (label, style) = if p.revoke_candidate {
+                ("✗ revoke".to_string(), BAD)
             } else {
-                let first = failed.first();
-                status_spans.push(Span::styled(
-                    format!(
-                        " ✗ doctor: {} failed ({}: {}) ",
-                        failed.len().max(1),
-                        first.map(|c| c.name.as_str()).unwrap_or("?"),
-                        first.map(|c| c.detail.as_str()).unwrap_or("")
-                    ),
-                    BAD,
-                ));
-            }
-        }
-        (None, Some(e)) => status_spans.push(Span::styled(format!(" doctor: {e} "), WARN)),
-        (None, None) => status_spans.push(Span::styled(" doctor: polling… ", DIM)),
+                let (icon, style) = peer_mark(p.status);
+                (format!("{icon} {}", p.status.as_str()), style)
+            };
+            Row::new(vec![
+                Cell::from(p.name.clone()),
+                Cell::from(p.ip.clone()),
+                Cell::from(Span::styled(label, style)),
+                Cell::from(
+                    p.handshake
+                        .map(format_age)
+                        .unwrap_or_else(|| "never".into()),
+                ),
+                Cell::from(p.endpoint.clone().unwrap_or_else(|| "—".into())),
+                Cell::from(format_rate(p.rx_rate)),
+                Cell::from(format_rate(p.tx_rate)),
+            ])
+        });
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(18),
+                Constraint::Length(16),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Min(8),
+                Constraint::Length(12),
+                Constraint::Length(12),
+            ],
+        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " peers — {} · {live} live · {stale} stale · {dead} dead{revoke_bit} ",
+            d.peers.len()
+        )))
+        .header(header)
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+        let selected = Some(d.selected.min(d.peers.len() - 1));
+        let mut tstate = ratatui::widgets::TableState::default().with_selected(selected);
+        f.render_stateful_widget(table, chunks[i], &mut tstate);
     }
-    if let Some(e) = &d.peers_error {
-        status_spans.push(Span::styled(format!(" peers: {e} "), BAD));
-    }
+    i += 1;
+
+    let mut detail = Vec::new();
     if let Some((msg, is_err)) = &d.notice {
-        status_spans.push(Span::styled(
-            format!(" {msg} "),
+        detail.push(Line::from(Span::styled(
+            msg.clone(),
             if *is_err { BAD } else { GOOD },
-        ));
+        )));
+    }
+    let peer_line = d
+        .peers
+        .get(d.selected.min(d.peers.len().saturating_sub(1)))
+        .map(selected_summary);
+    detail.push(Line::from(match peer_line {
+        Some(text) => Span::raw(text),
+        None => Span::styled("no peer selected", DIM),
+    }));
+    if revoke_selected {
+        let days = REVOKE_AFTER.as_secs() / 86400;
+        detail.push(Line::from(Span::styled(
+            format!("silent {days} days — c revokes"),
+            WARN,
+        )));
     }
     f.render_widget(
-        Paragraph::new(Line::from(status_spans))
-            .block(Block::default().borders(Borders::ALL).title(" status ")),
-        chunks[1],
+        Paragraph::new(detail).block(Block::default().borders(Borders::ALL).title(" selected ")),
+        chunks[i],
     );
+}
 
-    let header = Row::new(["NAME", "IP", "STATUS", "HANDSHAKE", "ENDPOINT", "RX", "TX"])
-        .style(Style::default().fg(Color::DarkGray));
-    let rows = d.peers.iter().map(|p| {
-        let (icon, style) = match p.status {
-            PeerStatus::Live => ("●", GOOD),
-            PeerStatus::Stale => ("◐", WARN),
-            PeerStatus::Dead => ("○", DIM),
+fn dashboard_alerts(
+    peers_error: Option<&str>,
+    services_error: Option<&str>,
+    doctor_error: Option<&str>,
+) -> Vec<String> {
+    let mut alerts = Vec::new();
+    if let Some(e) = peers_error {
+        alerts.push(format!("peers: {e}"));
+    }
+    if let Some(e) = services_error {
+        alerts.push(format!("services: {e}"));
+    }
+    if let Some(e) = doctor_error {
+        alerts.push(format!("doctor: {e}"));
+    }
+    alerts
+}
+
+fn services_line(services: &[ContainerInfo], failed: bool) -> Line<'static> {
+    if failed {
+        return Line::from(Span::styled("unavailable", BAD));
+    }
+    if services.is_empty() {
+        return Line::from(Span::styled(
+            "no amnezia-mesh containers — init or adopt first",
+            DIM,
+        ));
+    }
+    let mut spans = Vec::new();
+    for (i, c) in services.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        let (icon, style) = if c.running {
+            ("●", GOOD)
+        } else {
+            ("○", WARN)
         };
-        Row::new(vec![
-            Cell::from(p.name.clone()),
-            Cell::from(p.ip.clone()),
-            Cell::from(Span::styled(format!("{icon} {}", p.status.as_str()), style)),
-            Cell::from(
-                p.handshake
-                    .map(format_age)
-                    .unwrap_or_else(|| "never".into()),
-            ),
-            Cell::from(p.endpoint.clone().unwrap_or_else(|| "—".into())),
-            Cell::from(format_rate(p.rx_rate)),
-            Cell::from(format_rate(p.tx_rate)),
-        ])
-    });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(22),
-            Constraint::Length(14),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Min(20),
-            Constraint::Length(12),
-            Constraint::Length(12),
-        ],
+        spans.push(Span::styled(
+            format!("{icon} {}  {}", c.name, c.status),
+            style,
+        ));
+    }
+    Line::from(spans)
+}
+
+fn doctor_check_lines(checks: &[DoctorCheck]) -> (Vec<&DoctorCheck>, Vec<&DoctorCheck>) {
+    if checks.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mid = checks.len().div_ceil(2);
+    (
+        checks[..mid].iter().collect(),
+        checks[mid..].iter().collect(),
     )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" peers — {} · refresh 3s ", d.peers.len())),
+}
+
+fn check_spans(checks: &[&DoctorCheck]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (i, c) in checks.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let (mark, style) = if c.ok { ("✓", GOOD) } else { ("✗", BAD) };
+        spans.push(Span::styled(format!("{mark} {}", c.name), style));
+    }
+    spans
+}
+
+fn doctor_failures(checks: &[DoctorCheck]) -> String {
+    checks
+        .iter()
+        .filter(|c| !c.ok)
+        .map(|c| format!("{}: {}", c.name, c.detail))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn peer_counts(peers: &[ResolvedPeer]) -> (usize, usize, usize) {
+    let mut live = 0;
+    let mut stale = 0;
+    let mut dead = 0;
+    for p in peers {
+        match p.status {
+            PeerStatus::Live => live += 1,
+            PeerStatus::Stale => stale += 1,
+            PeerStatus::Dead => dead += 1,
+        }
+    }
+    (live, stale, dead)
+}
+
+fn peer_mark(status: PeerStatus) -> (&'static str, Style) {
+    match status {
+        PeerStatus::Live => ("●", GOOD),
+        PeerStatus::Stale => ("◐", WARN),
+        PeerStatus::Dead => ("○", DIM),
+    }
+}
+
+/// MagicDNS name when the peer name is a real mesh name. Short-pubkey
+/// fallbacks (`peer-` + the key's own characters) are not names.
+fn magic_dns(name: &str) -> Option<String> {
+    let ok = !name.is_empty()
+        && name.len() <= 32
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    ok.then(|| format!("{name}.awg"))
+}
+
+fn selected_summary(p: &ResolvedPeer) -> String {
+    let who = match magic_dns(&p.name) {
+        Some(dns) => format!("{}  {dns}", p.name),
+        None => p.name.clone(),
+    };
+    let hs = p
+        .handshake
+        .map(format_age)
+        .unwrap_or_else(|| "never".into());
+    let ep = p.endpoint.clone().unwrap_or_else(|| "—".into());
+    format!(
+        "{who}  {}  {}  handshake {hs}  endpoint {ep}  rx {}  tx {}",
+        p.ip,
+        p.status.as_str(),
+        format_rate(p.rx_rate),
+        format_rate(p.tx_rate)
     )
-    .header(header)
-    .row_highlight_style(
-        Style::default()
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    );
-    let selected = (!d.peers.is_empty()).then_some(d.selected.min(d.peers.len() - 1));
-    let mut tstate = ratatui::widgets::TableState::default().with_selected(selected);
-    f.render_stateful_widget(table, chunks[2], &mut tstate);
 }
 
 fn map_status_color(status: PeerStatus) -> Color {
@@ -847,26 +1205,77 @@ fn draw_map(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
 fn draw_secret(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let Some(s) = &app.secret else { return };
-    let mut lines: Vec<Line> = vec![
-        Line::from(vec![
-            Span::styled("peer: ", DIM),
-            Span::styled(s.name.clone(), GOOD),
-            Span::styled("   ip: ", DIM),
-            Span::raw(s.ip.clone()),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            " .vpn profile — import in the Amnezia app:",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-    ];
-    let budget = (area.height as usize).saturating_sub(8);
+    let mut lines: Vec<Line> = vec![Line::from(vec![
+        Span::styled("peer: ", DIM),
+        Span::styled(s.name.clone(), GOOD),
+        Span::styled("   ip: ", DIM),
+        Span::raw(s.ip.clone()),
+    ])];
+    match &s.view {
+        Some(view) => {
+            let who = if view.description.is_empty() {
+                view.host.clone()
+            } else {
+                view.description.clone()
+            };
+            lines.push(Line::from(Span::styled(
+                who,
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            let host = if view.port.is_empty() {
+                view.host.clone()
+            } else {
+                format!("{}:{}", view.host, view.port)
+            };
+            lines.push(Line::from(vec![
+                Span::styled("host ", DIM),
+                Span::raw(host),
+                Span::styled("   client ", DIM),
+                Span::raw(view.client_ip.clone()),
+                Span::styled("   dns ", DIM),
+                Span::raw(view.dns.clone()),
+            ]));
+        }
+        None => lines.push(Line::from(Span::styled(
+            "could not read a vpn:// summary",
+            WARN,
+        ))),
+    }
+
+    let inner_w = area.width.saturating_sub(2);
+    let inner_h = area.height.saturating_sub(2);
+    let qr_rows = inner_h.saturating_sub(lines.len() as u16 + 4);
+    let url = profile::find_vpn_url(&s.profile);
+    let qr = url.and_then(|u| profile::terminal_qr(u, inner_w, qr_rows));
+    if let Some(qr) = &qr {
+        lines.push(Line::from(""));
+        for row in qr.lines() {
+            lines.push(Line::from(row.to_string()));
+        }
+    } else if url.is_some() {
+        lines.push(Line::from(Span::styled(
+            "terminal QR is too dense for this pane — p saves a scannable PNG",
+            WARN,
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " .vpn profile — import in the Amnezia app:",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    let budget = (inner_h as usize).saturating_sub(lines.len());
     for l in s.profile.lines().take(budget) {
         lines.push(Line::from(Span::styled(l.to_string(), GOOD)));
     }
     if let Some(p) = &s.saved_to {
-        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(format!("saved: {p}"), GOOD)));
+    }
+    if let Some(p) = &s.qr_saved {
+        lines.push(Line::from(Span::styled(format!("qr: {p}"), GOOD)));
+    }
+    if let Some(err) = &s.qr_error {
+        lines.push(Line::from(Span::styled(err.clone(), BAD)));
     }
     let body = Paragraph::new(lines)
         .block(
@@ -876,4 +1285,341 @@ fn draw_secret(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         )
         .wrap(Wrap { trim: false });
     f.render_widget(body, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::config::{Config, ServerConfig};
+    use crate::doctor::DoctorReport;
+
+    fn check(name: &str, ok: bool, detail: &str) -> DoctorCheck {
+        DoctorCheck {
+            name: name.into(),
+            ok,
+            detail: detail.into(),
+        }
+    }
+
+    fn eight_checks() -> Vec<DoctorCheck> {
+        vec![
+            check("docker-daemon", true, "running"),
+            check("initialized", true, "state found"),
+            check("awg-container", true, "up"),
+            check("dns-container", true, "up"),
+            check("listen-port", true, "51820"),
+            check("ip-forward", true, "on"),
+            check("magicdns", true, "resolving"),
+            check("port-published", false, "udp port not published"),
+        ]
+    }
+
+    fn peer(name: &str, status: PeerStatus) -> ResolvedPeer {
+        ResolvedPeer {
+            name: name.into(),
+            ip: "100.64.0.2".into(),
+            pubkey: "abc".into(),
+            status,
+            handshake: Some(Duration::from_secs(90)),
+            endpoint: Some("203.0.113.5:51820".into()),
+            rx_rate: 512.0,
+            tx_rate: 1536.0,
+            revoke_candidate: false,
+        }
+    }
+
+    fn container(name: &str, running: bool) -> ContainerInfo {
+        ContainerInfo {
+            id: "abc123".into(),
+            name: name.into(),
+            image: "amnezia-awg".into(),
+            status: if running {
+                "Up 2 hours".into()
+            } else {
+                "Exited".into()
+            },
+            running,
+            candidate: false,
+        }
+    }
+
+    fn line_text(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    }
+
+    fn test_app() -> App {
+        let server = ServerConfig {
+            ssh_alias: "vps".into(),
+            cli_path: "awg-mesh".into(),
+            container: "amnezia-mesh-awg".into(),
+            login_shell: "sh".into(),
+            read_only: Some(true),
+            ..ServerConfig::default()
+        };
+        let config = Config {
+            active_server: "vps".into(),
+            servers: std::collections::BTreeMap::new(),
+            post_mutation_hook: None,
+        };
+        let mut app = App::new(
+            "vps".into(),
+            server,
+            config,
+            std::path::PathBuf::from("/tmp/awg-mesh-tui-test"),
+        );
+        app.screen = Screen::Dashboard;
+        app
+    }
+
+    fn frame_text(app: &App) -> String {
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| draw(f, app)).expect("draw");
+        let buf = term.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn doctor_lines_keep_every_check_and_name_failures() {
+        let checks = eight_checks();
+        let (top, bottom) = doctor_check_lines(&checks);
+        assert_eq!(top.len(), 4);
+        assert_eq!(bottom.len(), 4);
+        let shown: Vec<&str> = top
+            .iter()
+            .chain(bottom.iter())
+            .map(|c| c.name.as_str())
+            .collect();
+        let expected: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(shown, expected);
+        assert!(top.iter().all(|c| c.ok));
+        assert!(!bottom.last().unwrap().ok);
+
+        let (one, rest) = doctor_check_lines(&checks[..1]);
+        assert_eq!(one.len(), 1);
+        assert!(rest.is_empty());
+        let (empty_a, empty_b) = doctor_check_lines(&[]);
+        assert!(empty_a.is_empty() && empty_b.is_empty());
+
+        assert_eq!(
+            doctor_failures(&checks),
+            "port-published: udp port not published"
+        );
+        assert!(doctor_failures(&checks[..7]).is_empty());
+    }
+
+    #[test]
+    fn alerts_list_peers_then_services_then_doctor() {
+        assert!(dashboard_alerts(None, None, None).is_empty());
+        assert_eq!(
+            dashboard_alerts(Some("ssh timed out"), None, Some("reset")),
+            vec![
+                "peers: ssh timed out".to_string(),
+                "doctor: reset".to_string()
+            ]
+        );
+        assert_eq!(
+            dashboard_alerts(Some("a"), Some("b"), Some("c")),
+            vec![
+                "peers: a".to_string(),
+                "services: b".to_string(),
+                "doctor: c".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn magic_dns_matches_mesh_names_only() {
+        assert_eq!(magic_dns("phone"), Some("phone.awg".into()));
+        assert_eq!(magic_dns("phone-2"), Some("phone-2.awg".into()));
+        assert_eq!(
+            magic_dns(&"n".repeat(32)),
+            Some(format!("{}.awg", "n".repeat(32)))
+        );
+        assert_eq!(magic_dns(""), None);
+        assert_eq!(magic_dns(&"n".repeat(33)), None);
+        assert_eq!(magic_dns("Phone"), None);
+        assert_eq!(magic_dns("peer-AbC+def1"), None);
+        assert_eq!(magic_dns("peer-abc/def="), None);
+    }
+
+    #[test]
+    fn peer_counts_and_selected_summary() {
+        let peers = vec![
+            peer("phone", PeerStatus::Live),
+            peer("laptop", PeerStatus::Stale),
+            peer("old", PeerStatus::Dead),
+            peer("older", PeerStatus::Dead),
+        ];
+        assert_eq!(peer_counts(&peers), (1, 1, 2));
+        let summary = selected_summary(&peers[0]);
+        assert_eq!(
+            summary,
+            "phone  phone.awg  100.64.0.2  live  handshake 1m 30s  endpoint 203.0.113.5:51820  rx 512 B/s  tx 1.5 KiB/s"
+        );
+        let mut unnamed = peers[0].clone();
+        unnamed.name = "peer-AbC+def1".into();
+        unnamed.status = PeerStatus::Dead;
+        unnamed.handshake = None;
+        unnamed.endpoint = None;
+        assert_eq!(
+            selected_summary(&unnamed),
+            "peer-AbC+def1  100.64.0.2  dead  handshake never  endpoint —  rx 512 B/s  tx 1.5 KiB/s"
+        );
+    }
+
+    #[test]
+    fn services_line_states() {
+        assert_eq!(
+            line_text(&services_line(&[], false)),
+            "no amnezia-mesh containers — init or adopt first"
+        );
+        assert_eq!(line_text(&services_line(&[], true)), "unavailable");
+        let line = services_line(
+            &[
+                container("amnezia-mesh-awg", true),
+                container("amnezia-mesh-dns", false),
+            ],
+            false,
+        );
+        assert_eq!(
+            line_text(&line),
+            "● amnezia-mesh-awg  Up 2 hours   ○ amnezia-mesh-dns  Exited"
+        );
+    }
+
+    #[test]
+    fn dashboard_frame_shows_checks_peers_and_ssh_banner() {
+        let mut app = test_app();
+        app.dashboard.services = vec![
+            container("amnezia-mesh-awg", true),
+            container("amnezia-mesh-dns", true),
+        ];
+        app.dashboard.doctor = Some(DoctorReport {
+            ok: false,
+            checks: eight_checks(),
+        });
+        app.dashboard.doctor_error = Some("connection reset by peer".into());
+        app.dashboard.peers_error = Some("ssh: connect to host vps port 22: timed out".into());
+        app.dashboard.peers = vec![
+            peer("phone", PeerStatus::Live),
+            peer("laptop", PeerStatus::Stale),
+        ];
+        app.dashboard.selected = 0;
+        app.dashboard.notice = Some(("renamed tablet → phone".into(), false));
+
+        let view = frame_text(&app);
+        assert!(view.contains("read-only"), "{view}");
+        assert!(
+            view.contains("doctor · 1 failed · refresh failed"),
+            "{view}"
+        );
+        for name in [
+            "docker-daemon",
+            "initialized",
+            "awg-container",
+            "dns-container",
+            "listen-port",
+            "ip-forward",
+            "magicdns",
+            "port-published",
+        ] {
+            assert!(view.contains(name), "missing {name}\n{view}");
+        }
+        assert!(
+            view.contains("port-published: udp port not published"),
+            "{view}"
+        );
+        assert!(
+            view.contains("peers: ssh: connect to host vps port 22: timed out"),
+            "{view}"
+        );
+        assert!(view.contains("doctor: connection reset by peer"), "{view}");
+        assert!(view.contains("amnezia-mesh-awg"), "{view}");
+        assert!(view.contains("amnezia-mesh-dns"), "{view}");
+        assert!(view.contains("phone"), "{view}");
+        assert!(view.contains("100.64.0.2"), "{view}");
+        assert!(view.contains("203.0.113.5:51820"), "{view}");
+        assert!(view.contains("phone.awg"), "{view}");
+        assert!(view.contains("renamed tablet → phone"), "{view}");
+        assert!(view.contains("1 live · 1 stale · 0 dead"), "{view}");
+    }
+
+    #[test]
+    fn dashboard_frame_empty_and_doctor_down() {
+        let mut app = test_app();
+        app.server.read_only = Some(false);
+        app.dashboard.doctor_error = Some("ssh: Connection refused".into());
+        let view = frame_text(&app);
+        assert!(!view.contains("read-only"), "{view}");
+        assert!(view.contains("doctor: ssh: Connection refused"), "{view}");
+        assert!(
+            view.contains("unavailable — the error is in the banner"),
+            "{view}"
+        );
+        assert!(
+            view.contains("no amnezia-mesh containers — init or adopt first"),
+            "{view}"
+        );
+        assert!(view.contains("no peers yet — a adds one"), "{view}");
+        assert!(view.contains("no peer selected"), "{view}");
+    }
+
+    #[test]
+    fn dashboard_marks_a_fourteen_day_peer_for_revoke() {
+        let mut app = test_app();
+        app.server.read_only = Some(false);
+        let mut old = peer("tablet", PeerStatus::Dead);
+        old.revoke_candidate = true;
+        old.handshake = Some(Duration::from_secs(14 * 86400));
+        app.dashboard.peers = vec![old];
+        app.dashboard.selected = 0;
+        let view = frame_text(&app);
+        assert!(view.contains("✗ revoke"), "{view}");
+        assert!(view.contains("1 revoke"), "{view}");
+        assert!(view.contains("silent 14 days — c revokes"), "{view}");
+        assert!(view.contains("c 14d"), "{view}");
+    }
+
+    #[test]
+    fn secret_screen_shows_the_public_summary() {
+        let value = serde_json::json!({
+            "description": "192.0.2.10 (laptop exit)",
+            "hostName": "192.0.2.10",
+            "dns1": "100.64.0.1",
+            "containers": [{
+                "awg": {
+                    "port": "443",
+                    "last_config": "{\"client_ip\":\"100.64.0.7\",\"client_priv_key\":\"SECRETKEY\"}"
+                }
+            }]
+        });
+        let url = profile::encode_profile(&value).unwrap();
+        let mut app = test_app();
+        app.screen = Screen::Secret;
+        app.secret = Some(crate::app::SecretState::issued(
+            "laptop".into(),
+            "100.64.0.7".into(),
+            url,
+        ));
+        let view = frame_text(&app);
+        assert!(view.contains("192.0.2.10 (laptop exit)"), "{view}");
+        assert!(view.contains("192.0.2.10:443"), "{view}");
+        assert!(view.contains("100.64.0.7"), "{view}");
+        assert!(view.contains("100.64.0.1"), "{view}");
+        assert!(!view.contains("SECRETKEY"), "{view}");
+        assert!(view.contains("p save QR"), "{view}");
+    }
 }

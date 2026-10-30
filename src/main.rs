@@ -6,22 +6,25 @@ mod docker;
 mod doctor;
 mod geo;
 mod inspect;
+mod install;
 mod logs;
 mod mutate;
 mod peers;
 mod probe;
+mod profile;
 mod show;
 mod stats;
 mod transport;
 mod ui;
 mod watchdog;
+mod wizard;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
-use crossterm::event::{KeyCode, KeyEvent};
+use clap::{Parser, Subcommand};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::Mutex;
@@ -29,10 +32,17 @@ use tokio::sync::Mutex;
 use app::{App, Job, Screen};
 use config::{Config, ServerConfig};
 use transport::Transport;
+use wizard::RunOutcome;
 
 #[derive(Parser)]
-#[command(name = "awg-mesh-tui", about = "TUI admin panel for amnezia-mesh")]
+#[command(
+    name = "awg-mesh-tui",
+    about = "TUI admin panel and SSH installer for amnezia-mesh"
+)]
 struct Args {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+
     /// Configured server name (see `servers` in the config file).
     #[arg(long)]
     server: Option<String>,
@@ -62,9 +72,45 @@ struct Args {
     mock: bool,
 }
 
+#[derive(Subcommand)]
+enum Cmd {
+    /// Copy the bundled Linux awg-mesh CLI onto a server over SSH.
+    Install(InstallArgs),
+}
+
+#[derive(Parser, Debug)]
+struct InstallArgs {
+    /// SSH alias or user@host. Omit on a terminal to be asked.
+    #[arg(long)]
+    ssh: Option<String>,
+
+    /// Private key passed to `ssh -i`. Omit to use the agent and ~/.ssh/config.
+    #[arg(long)]
+    identity: Option<PathBuf>,
+
+    /// Directory that contains `linux_amd64/` and `linux_arm64/` payloads.
+    #[arg(long)]
+    payload_dir: Option<PathBuf>,
+
+    /// Do not write the server into the panel config.
+    #[arg(long)]
+    no_save: bool,
+
+    /// Config file to update (default: ~/.config/awg-mesh-tui/config.toml).
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Print one JSON object on stdout and do not prompt.
+    #[arg(long)]
+    json: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(Cmd::Install(install)) = args.cmd {
+        return install_cmd(install).await;
+    }
     let cfg_path = args.config.clone().unwrap_or_else(config::default_path);
     let cfg = Config::load(&cfg_path)
         .with_context(|| format!("cannot load config {}", cfg_path.display()))?;
@@ -78,7 +124,10 @@ async fn main() -> Result<()> {
     let server = match server {
         Some(s) => s,
         None => bail!(
-            "no server '{}' in {}\n\nexample entry:\n\
+            "no server '{}' in {}\n\n\
+             copy the CLI onto a VPS first:\n\
+             awg-mesh-tui install --ssh user@host\n\n\
+             or add an entry:\n\
              active_server = \"prod\"\n\n\
              [servers.prod]\n\
              ssh_alias = \"my-vps\"\n",
@@ -107,6 +156,84 @@ async fn main() -> Result<()> {
     }
 
     run_tui(&name, server, cfg, cfg_path, transport).await
+}
+
+async fn install_cmd(args: InstallArgs) -> Result<()> {
+    let ssh = match args.ssh {
+        Some(s) => s,
+        None if args.json => {
+            return install_fail(true, "--ssh is required with --json");
+        }
+        None if !std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
+            return install_fail(false, "pass --ssh (there is no terminal to ask)");
+        }
+        None => match install::prompt_ssh_target() {
+            Ok(s) => s,
+            Err(e) => return install_fail(false, &e),
+        },
+    };
+    let mut opts = install::InstallOpts::new(ssh.clone());
+    opts.identity = args.identity;
+    opts.payload_dir = args
+        .payload_dir
+        .or_else(|| std::env::var_os("AWG_MESH_PAYLOAD_DIR").map(PathBuf::from));
+    let outcome = match install::install_server(&opts).await {
+        Ok(o) => o,
+        Err(e) => return install_fail(args.json, &e),
+    };
+
+    let mut config_path = None;
+    if !args.no_save {
+        let path = args.config.clone().unwrap_or_else(config::default_path);
+        let mut cfg = match Config::load(&path) {
+            Ok(c) => c,
+            Err(e) => return install_fail(args.json, &format!("config: {e}")),
+        };
+        let name = install::server_name(&ssh);
+        let mut server = cfg.servers.get(&name).cloned().unwrap_or_default();
+        server.ssh_alias = ssh.clone();
+        server.cli_path = outcome.remote_path.clone();
+        cfg.servers.insert(name.clone(), server);
+        if cfg.active_server.is_empty() {
+            cfg.active_server = name.clone();
+        }
+        if let Err(e) = cfg.save(&path) {
+            return install_fail(args.json, &format!("config: {e}"));
+        }
+        config_path = Some(path.display().to_string());
+    }
+
+    if args.json {
+        let mut report = serde_json::json!({
+            "ok": true,
+            "ssh": ssh,
+            "arch": outcome.arch,
+            "remote_path": outcome.remote_path,
+            "version": outcome.version,
+            "server_name": install::server_name(&ssh),
+        });
+        if let Some(path) = config_path {
+            report["config"] = serde_json::Value::String(path);
+        }
+        println!("{report}");
+        return Ok(());
+    }
+    println!(
+        "copied {ssh}:{}\n{}\nnext: awg-mesh-tui    (i = init, a = adopt)",
+        outcome.remote_path, outcome.version
+    );
+    if let Some(path) = config_path {
+        println!("saved {path}");
+    }
+    Ok(())
+}
+
+fn install_fail(json: bool, err: &str) -> Result<()> {
+    if json {
+        println!("{}", serde_json::json!({"ok": false, "error": err}));
+        std::process::exit(1);
+    }
+    bail!("{err}")
 }
 
 async fn probe_once(name: &str, server: &ServerConfig, transport: &Transport) -> Result<()> {
@@ -314,8 +441,19 @@ async fn event_loop(
 /// Returns true when the user asked to quit.
 async fn handle_key(app: &Arc<Mutex<App>>, key: KeyEvent) -> bool {
     let mut a = app.lock().await;
-    if key.code == KeyCode::Char('q') {
+    // Raw mode swallows the terminal SIGINT, including during a long init/adopt.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
         return true;
+    }
+    let typing =
+        a.dashboard.input.is_some() || (a.screen == Screen::Wizard && a.wizard.form.editing);
+    // A running init/adopt must finish; killing the TUI drops the ssh session.
+    let busy = a.screen == Screen::Run && a.run.running;
+    if key.code == KeyCode::Char('q') && !typing && !busy {
+        return true;
+    }
+    if busy {
+        return false;
     }
     match a.screen {
         Screen::Preflight => match key.code {
@@ -330,6 +468,7 @@ async fn handle_key(app: &Arc<Mutex<App>>, key: KeyEvent) -> bool {
                 }
             }
             KeyCode::Char('g') => a.enter_dashboard(),
+            KeyCode::Char('i') => a.open_init_wizard(),
             KeyCode::Char('l') => a.enter_log(Screen::Preflight),
             KeyCode::Esc => a.bootstrap.confirm_pending = false,
             _ => {}
@@ -360,11 +499,53 @@ async fn handle_key(app: &Arc<Mutex<App>>, key: KeyEvent) -> bool {
                 _ => {}
             }
         }
-        Screen::Inspect => {
-            if key.code == KeyCode::Esc {
-                a.screen = Screen::Discovery;
+        Screen::Inspect => match key.code {
+            KeyCode::Esc => a.screen = Screen::Discovery,
+            KeyCode::Char('a') => a.open_adopt_wizard(),
+            _ => {}
+        },
+        Screen::Wizard => {
+            if a.wizard.form.editing {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Esc => a.wizard.form.editing = false,
+                    KeyCode::Backspace => a.wizard.form.backspace(),
+                    KeyCode::Char(c) => a.wizard.form.push_char(c),
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Up => a.wizard.form.move_sel(-1),
+                    KeyCode::Down => a.wizard.form.move_sel(1),
+                    KeyCode::Enter | KeyCode::Char(' ') => a.wizard.form.activate(),
+                    KeyCode::Char('r') => a.arm_provision(),
+                    KeyCode::Char('h') => {
+                        a.wizard.form.detect_force = true;
+                        a.request(Job::DetectHost);
+                    }
+                    KeyCode::Esc => {
+                        if a.wizard.form.confirm_pending {
+                            a.wizard.form.confirm_pending = false;
+                        } else {
+                            a.screen = a.wizard.return_to;
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
+        Screen::Run => match key.code {
+            KeyCode::Esc => a.screen = a.run.return_to,
+            KeyCode::Enter if a.run.outcome == Some(RunOutcome::Success) => a.enter_dashboard(),
+            KeyCode::Up => a.scroll_run(-1),
+            KeyCode::Down => a.scroll_run(1),
+            KeyCode::PageUp => a.scroll_run(-10),
+            KeyCode::PageDown => a.scroll_run(10),
+            KeyCode::End | KeyCode::Char('G') => {
+                a.run.follow = true;
+                a.run.scroll = a.run.lines.len().saturating_sub(1);
+            }
+            _ => {}
+        },
         Screen::Dashboard => {
             if a.dashboard.input.is_some() {
                 match key.code {
@@ -394,6 +575,7 @@ async fn handle_key(app: &Arc<Mutex<App>>, key: KeyEvent) -> bool {
                     KeyCode::Char('a') => a.open_add_input(),
                     KeyCode::Char('r') => a.open_rename_input(),
                     KeyCode::Char('x') | KeyCode::Delete => a.request_revoke(),
+                    KeyCode::Char('c') => a.revoke_candidate_key(),
                     KeyCode::Char('l') => a.enter_log(Screen::Dashboard),
                     KeyCode::Char('m') => a.screen = Screen::Map,
                     _ => {}
@@ -401,20 +583,8 @@ async fn handle_key(app: &Arc<Mutex<App>>, key: KeyEvent) -> bool {
             }
         }
         Screen::Secret => match key.code {
-            KeyCode::Char('s') => {
-                let saved = a.secret.as_ref().and_then(|s| {
-                    let dir = std::env::var_os("HOME")
-                        .map(PathBuf::from)?
-                        .join("Downloads");
-                    std::fs::create_dir_all(&dir).ok()?;
-                    let path = dir.join(format!("{}.vpn", s.name));
-                    std::fs::write(&path, s.profile.as_bytes()).ok()?;
-                    Some(path.display().to_string())
-                });
-                if let Some(p) = saved {
-                    a.mark_secret_saved(p);
-                }
-            }
+            KeyCode::Char('s') => a.save_secret_vpn(),
+            KeyCode::Char('p') => a.save_secret_qr(),
             KeyCode::Esc => a.close_secret(),
             _ => {}
         },

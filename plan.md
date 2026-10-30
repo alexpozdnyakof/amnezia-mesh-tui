@@ -172,7 +172,7 @@
 
 - Userspace-fallback в `start.sh` (патч в `../amnezia-mesh`) для серверов без amnezia-модуля ядра — продуктово полезно для generic VPS; до решения такие сервера не пройдут doctor после init/adopt (локальный стенд ходит в обход через ручной подъём, прод-стек — нет).
 - Дефолты порогов live/stale/revoke-N — калибруем на живых данных M2/M3.
-- Способ раздачи: `cargo install --git` vs brew tap — решаем к M4.
+- Раздача: Mac cask `awg-mesh` (вместе с Go CLI). `awg-mesh-tui install` копирует linux-payload на сервер по ssh; `init`/`adopt` делает мастер панели. `cargo install` не используем.
 - Multi-server UI (переключатель между серверами) — после M2.
 - Зависимость от Эпика 1 (Go CLI): слабая, TUI говорит JSON-over-ssh; M4 работает на python CLI как canonical сейчас.
 

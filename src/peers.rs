@@ -7,6 +7,9 @@ use crate::transport::Transport;
 /// Status thresholds (plan defaults; config overrides come later).
 pub const LIVE_MAX_AGE: Duration = Duration::from_secs(3 * 60);
 pub const STALE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// A handshake this old is a revoke candidate. `None` is not: a new peer
+/// has never handshaken and must not be offered for one-key revoke.
+pub const REVOKE_AFTER: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerStatus {
@@ -47,6 +50,8 @@ pub struct ResolvedPeer {
     /// bytes/sec since the previous poll; 0 on the first poll.
     pub rx_rate: f64,
     pub tx_rate: f64,
+    /// Last handshake is at least [`REVOKE_AFTER`] old.
+    pub revoke_candidate: bool,
 }
 
 /// Merge a fresh `awg show` snapshot into dashboard rows.
@@ -79,6 +84,7 @@ pub fn resolve_peers(
                 Some(age) if age <= STALE_MAX_AGE => PeerStatus::Stale,
                 Some(_) => PeerStatus::Dead,
             };
+            let revoke_candidate = matches!(p.handshake, Some(age) if age >= REVOKE_AFTER);
             let (rx_rate, tx_rate) = match (p.rx, p.tx) {
                 (Some(rx), Some(tx)) => {
                     let (mut drx, mut dtx, mut dt) = (0.0_f64, 0.0_f64, 0.0_f64);
@@ -105,6 +111,7 @@ pub fn resolve_peers(
                 endpoint: p.endpoint.clone(),
                 rx_rate,
                 tx_rate,
+                revoke_candidate,
             }
         })
         .collect()
@@ -206,8 +213,30 @@ mod tests {
         assert_eq!(rows[1].status, PeerStatus::Stale);
         assert_eq!(rows[2].status, PeerStatus::Dead);
         assert_eq!(rows[3].status, PeerStatus::Dead);
+        assert!(rows.iter().all(|r| !r.revoke_candidate));
         assert!(rows[0].name.starts_with("peer-"));
         assert_eq!(rows[1].ip, "10.0.0.2");
+    }
+
+    #[test]
+    fn revoke_candidate_starts_at_fourteen_days() {
+        let show = vec![
+            peer("A", "10.0.0.1", Some(REVOKE_AFTER - Duration::from_secs(1))),
+            peer("B", "10.0.0.2", Some(REVOKE_AFTER)),
+            peer("C", "10.0.0.3", None),
+        ];
+        let mut samples = HashMap::new();
+        let rows = resolve_peers(
+            &show,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut samples,
+            Instant::now(),
+        );
+        assert!(!rows[0].revoke_candidate);
+        assert!(rows[1].revoke_candidate);
+        assert_eq!(rows[1].status, PeerStatus::Dead);
+        assert!(!rows[2].revoke_candidate);
     }
 
     #[test]
