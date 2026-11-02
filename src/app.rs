@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
-use zeroize::Zeroize;
 
 use crate::bootstrap::bootstrap;
 use crate::config::{Config, ServerConfig};
@@ -31,6 +30,53 @@ fn downloads_dir() -> Option<PathBuf> {
     let dir = PathBuf::from(home).join("Downloads");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
+}
+
+/// Pipe `text` into the first clipboard tool that works: pbcopy (macOS),
+/// wl-copy (Wayland), xclip, xsel (X11). Runs locally where the TUI lives.
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    const TOOLS: &[&[&str]] = &[
+        &["pbcopy"],
+        &["wl-copy"],
+        &["xclip", "-selection", "clipboard"],
+        &["xsel", "--clipboard", "--input"],
+    ];
+    let mut errors = Vec::new();
+    for tool in TOOLS {
+        let mut child = match Command::new(tool[0])
+            .args(&tool[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                errors.push(format!("{}: {e}", tool[0]));
+                continue;
+            }
+        };
+        let write_result = child
+            .stdin
+            .as_mut()
+            .expect("stdin is piped")
+            .write_all(text.as_bytes())
+            .and_then(|()| {
+                drop(child.stdin.take());
+                child.wait().map(|_| ())
+            });
+        match write_result {
+            Ok(()) => return Ok(()),
+            Err(e) => errors.push(format!("{}: {e}", tool.join(" "))),
+        }
+    }
+    Err(format!(
+        "no working clipboard tool (tried pbcopy, wl-copy, xclip, xsel) — {}",
+        errors.join("; ")
+    ))
 }
 
 fn file_stem(name: &str) -> String {
@@ -68,8 +114,16 @@ pub enum Job {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Mutation {
     Add(String),
-    Rename { old: String, new: String },
+    Rename {
+        old: String,
+        new: String,
+    },
     Revoke(String),
+    /// Read the .vpn that `peer add` already wrote. Same key, not a rotation.
+    ShowKey {
+        name: String,
+        ip: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -181,12 +235,28 @@ pub struct SecretState {
     pub profile: String,
     pub saved_to: Option<String>,
     pub view: Option<ProfileView>,
+    /// True for a peer just created. False when showing the saved copy.
+    pub fresh: bool,
+    /// `c` copied the vpn:// link to the system clipboard.
+    pub copied: bool,
+    /// Why the clipboard copy failed, if it did.
+    pub copy_error: Option<String>,
+    /// `p` wrote the QR png here.
     pub qr_saved: Option<String>,
+    /// Why the QR png write failed, if it did.
     pub qr_error: Option<String>,
 }
 
 impl SecretState {
     pub(crate) fn issued(name: String, ip: String, profile: String) -> Self {
+        Self::pack(name, ip, profile, true)
+    }
+
+    pub(crate) fn saved(name: String, ip: String, profile: String) -> Self {
+        Self::pack(name, ip, profile, false)
+    }
+
+    fn pack(name: String, ip: String, profile: String, fresh: bool) -> Self {
         let view = profile::find_vpn_url(&profile)
             .and_then(|url| profile::decode_profile(url).ok())
             .as_ref()
@@ -197,6 +267,9 @@ impl SecretState {
             profile,
             saved_to: None,
             view,
+            fresh,
+            copied: false,
+            copy_error: None,
             qr_saved: None,
             qr_error: None,
         }
@@ -649,6 +722,27 @@ impl App {
         }
     }
 
+    /// Show the .vpn `peer add` left on the server. Does not rotate the key.
+    pub fn show_saved_key(&mut self) {
+        if self.reject_when_read_only() {
+            return;
+        }
+        let Some(peer) = self.selected_peer() else {
+            return;
+        };
+        let name = peer.name.clone();
+        let ip = peer.ip.clone();
+        if !mutate::valid_name(&name) {
+            self.mutate_notice(
+                "this row has no mesh name, so there is no saved profile to read".into(),
+                true,
+            );
+            return;
+        }
+        self.dashboard.notice = None;
+        self.request(Job::Mutate(Mutation::ShowKey { name, ip }));
+    }
+
     /// Close the secret screen; the profile is zeroized on drop.
     pub fn close_secret(&mut self) {
         self.secret = None;
@@ -681,42 +775,62 @@ impl App {
         }
     }
 
-    pub fn save_secret_qr(&mut self) {
-        let extracted = self.secret.as_ref().map(|secret| {
-            (
-                profile::find_vpn_url(&secret.profile).map(str::to_string),
-                file_stem(&secret.name),
-            )
-        });
-        let Some((url, stem)) = extracted else {
+    /// Copy the vpn:// link (not the whole profile) to the system clipboard.
+    pub fn copy_secret_link(&mut self) {
+        use zeroize::Zeroize;
+        let Some(mut url) = self
+            .secret
+            .as_ref()
+            .and_then(|s| profile::find_vpn_url(&s.profile))
+            .map(str::to_string)
+        else {
             return;
         };
-        let Some(mut url) = url else {
-            if let Some(secret) = &mut self.secret {
-                secret.qr_error = Some("no vpn:// link in this profile".into());
-            }
-            return;
-        };
-        let Some(dir) = downloads_dir() else {
-            url.zeroize();
-            if let Some(secret) = &mut self.secret {
-                secret.qr_error = Some("could not create ~/Downloads".into());
-            }
-            return;
-        };
-        let path = dir.join(format!("{stem}-qr.png"));
-        let written = profile::write_qr_png(&url, &path);
+        let result = copy_to_clipboard(&url);
         url.zeroize();
-        match written {
-            Ok(()) => {
-                if let Some(secret) = &mut self.secret {
-                    secret.qr_saved = Some(path.display().to_string());
-                    secret.qr_error = None;
+        if let Some(secret) = &mut self.secret {
+            match result {
+                Ok(()) => {
+                    secret.copied = true;
+                    secret.copy_error = None;
+                }
+                Err(e) => {
+                    secret.copied = false;
+                    secret.copy_error = Some(e);
                 }
             }
-            Err(e) => {
-                if let Some(secret) = &mut self.secret {
-                    secret.qr_error = Some(e.to_string());
+        }
+    }
+
+    /// `p`: compact QR png (~320 px) into ~/Downloads, for sharing in a
+    /// messenger or scanning from the phone gallery. Explicit action — the
+    /// terminal QR stays the default.
+    pub fn save_secret_qr(&mut self) {
+        use zeroize::Zeroize;
+        let Some(mut url) = self
+            .secret
+            .as_ref()
+            .and_then(|s| profile::find_vpn_url(&s.profile))
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let result = (|| {
+            let dir = downloads_dir().ok_or("could not create ~/Downloads")?;
+            let stem = self.secret.as_ref().map(|s| file_stem(&s.name));
+            let path = dir.join(format!("{}-qr.png", stem.unwrap_or_else(|| "peer".into())));
+            profile::write_qr_png(&url, &path).map_err(|e| e.to_string())?;
+            Ok(path.display().to_string())
+        })();
+        url.zeroize();
+        if let Some(secret) = &mut self.secret {
+            match result {
+                Ok(path) => {
+                    secret.qr_saved = Some(path);
+                    secret.qr_error = None;
+                }
+                Err(e) => {
+                    secret.qr_error = Some(e);
                 }
             }
         }
@@ -982,7 +1096,9 @@ impl App {
                         Added(PeerAdded, Option<String>),
                         Renamed(String, String),
                         Revoked(String),
+                        Shown(String, String, String),
                     }
+                    let show_key = matches!(mutation, Mutation::ShowKey { .. });
                     let outcome = async {
                         match &mutation {
                             Mutation::Add(name) => {
@@ -1003,15 +1119,27 @@ impl App {
                                 mutate::peer_revoke(&transport, &server, name).await?;
                                 Ok(Outcome::Revoked(name.clone()))
                             }
+                            Mutation::ShowKey { name, ip } => {
+                                let path = mutate::saved_exit_profile(&server.cli_path, name)?;
+                                let profile = mutate::fetch_profile(&transport, &path).await?;
+                                if !profile.contains("vpn://") {
+                                    return Err(MutateError::Failed(
+                                        "saved file has no vpn:// link".into(),
+                                    ));
+                                }
+                                Ok(Outcome::Shown(name.clone(), ip.clone(), profile))
+                            }
                         }
                     }
                     .await
                     .map_err(|e: MutateError| e.to_string());
                     let mut a = handle.lock().await;
-                    // The stack restarts after every mutation: hush the
-                    // poll for a few seconds and refresh right away.
-                    a.dashboard.poll_silence = Some(Instant::now() + Duration::from_secs(10));
-                    a.queue.push(Job::PollPeers);
+                    // peer add/rename/revoke restart the stack. Reading a
+                    // saved .vpn does not.
+                    if !show_key {
+                        a.dashboard.poll_silence = Some(Instant::now() + Duration::from_secs(10));
+                        a.queue.push(Job::PollPeers);
+                    }
                     match outcome {
                         Ok(Outcome::Added(added, profile)) => {
                             a.mutate_notice(format!("added {} → {}", added.name, added.ip), false);
@@ -1029,10 +1157,23 @@ impl App {
                             a.mutate_notice(format!("revoked {name}"), false);
                             a.dashboard.selected = 0;
                         }
+                        Ok(Outcome::Shown(name, ip, profile)) => {
+                            a.secret = Some(SecretState::saved(name, ip, profile));
+                            a.screen = Screen::Secret;
+                        }
+                        Err(e) if show_key => {
+                            let msg = if e.contains("cannot read") || e.contains("No such file") {
+                                "no saved .vpn for this peer. peer add keeps one; an adopted device has no private key on the server".into()
+                            } else {
+                                format!("could not read the saved key: {e}")
+                            };
+                            a.mutate_notice(msg, true);
+                        }
                         Err(e) => a.mutate_notice(format!("mutation failed: {e}"), true),
                     }
-                    if matches!(a.screen, Screen::Secret)
-                        || a.dashboard.notice.as_ref().is_some_and(|(_, err)| !err)
+                    if !show_key
+                        && (matches!(a.screen, Screen::Secret)
+                            || a.dashboard.notice.as_ref().is_some_and(|(_, err)| !err))
                     {
                         if let Some(hook) = a.config.post_mutation_hook.clone() {
                             let _ = tokio::process::Command::new("sh")
@@ -1381,6 +1522,32 @@ mod tests {
         app.dashboard.peers = vec![row("gone", true)];
         app.revoke_candidate_key();
         assert!(app.dashboard.confirm.is_none());
+        let (_, err) = app.dashboard.notice.unwrap();
+        assert!(err);
+    }
+
+    #[test]
+    fn k_queues_the_saved_profile_of_the_selected_peer() {
+        let mut app = test_app();
+        app.server.read_only = Some(false);
+        app.server.cli_path = "/root/amnezia-mesh/bin/awg-mesh".into();
+        app.dashboard.peers = vec![row("phone", false)];
+        app.show_saved_key();
+        assert!(matches!(
+            app.queue.last(),
+            Some(Job::Mutate(Mutation::ShowKey { name, ip }))
+                if name == "phone" && ip == "100.64.0.8"
+        ));
+    }
+
+    #[test]
+    fn k_on_a_read_only_server_does_not_queue() {
+        let mut app = test_app();
+        app.server.read_only = Some(true);
+        app.dashboard.peers = vec![row("phone", false)];
+        let before = app.queue.len();
+        app.show_saved_key();
+        assert_eq!(app.queue.len(), before);
         let (_, err) = app.dashboard.notice.unwrap();
         assert!(err);
     }

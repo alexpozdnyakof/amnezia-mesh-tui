@@ -13,9 +13,8 @@ use base64::Engine;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use image::Luma;
-use qrcode::render::unicode::Dense1x2;
-use qrcode::QrCode;
+use qrcode::types::Color as ModuleColor;
+use qrcode::{EcLevel, QrCode};
 
 /// Refuse profiles whose JSON expands past this. Real vpn:// payloads are a few KiB.
 const MAX_PROFILE_JSON: usize = 256 * 1024;
@@ -176,33 +175,129 @@ fn client_ip_of(awg: &serde_json::Value) -> String {
         .to_string()
 }
 
-/// Half-block QR, or `None` when it does not fit the pane.
+/// Braille QR (2×4 modules per cell) at the largest quiet zone that fits.
+/// `None` when the code cannot be built or is wider/taller than the pane.
+/// Error correction is L so a real `vpn://` stays small enough to scan.
 pub fn terminal_qr(data: &str, max_cols: u16, max_rows: u16) -> Option<String> {
     if data.is_empty() || max_cols == 0 || max_rows == 0 {
         return None;
     }
-    let code = QrCode::new(data.as_bytes()).ok()?;
-    let rendered = code.render::<Dense1x2>().quiet_zone(true).build();
-    let width = rendered
-        .lines()
-        .next()
-        .map(|line| line.chars().count())
-        .unwrap_or(0);
-    let height = rendered.lines().count();
-    if width == 0 || height == 0 || width > max_cols as usize || height > max_rows as usize {
-        return None;
+    let code = QrCode::with_error_correction_level(data.as_bytes(), EcLevel::L).ok()?;
+    let modules = code.width();
+    for quiet in (2..=4).rev() {
+        let side = modules + quiet * 2;
+        let cols = side.div_ceil(2);
+        let rows = side.div_ceil(4);
+        if cols <= max_cols as usize && rows <= max_rows as usize {
+            return Some(render_braille(&code, quiet));
+        }
     }
-    Some(rendered)
+    None
 }
 
+/// `qrencode`-style half-block QR (1×2 modules per cell). Solid square
+/// modules scan more reliably from a phone than braille dots, but the code
+/// needs `side` cols × `side/2` rows — pick [`terminal_qr`] when the pane
+/// is narrow. Same quiet-zone fallback as `terminal_qr`.
+pub fn terminal_qr_blocks(data: &str, max_cols: u16, max_rows: u16) -> Option<String> {
+    if data.is_empty() || max_cols == 0 || max_rows == 0 {
+        return None;
+    }
+    let code = QrCode::with_error_correction_level(data.as_bytes(), EcLevel::L).ok()?;
+    let modules = code.width();
+    for quiet in (2..=4).rev() {
+        let side = modules + quiet * 2;
+        if side <= max_cols as usize && side.div_ceil(2) <= max_rows as usize {
+            return Some(render_half_blocks(&code, quiet));
+        }
+    }
+    None
+}
+
+fn dark_at(code: &QrCode, modules: usize, quiet: usize, x: usize, y: usize) -> bool {
+    if x < quiet || y < quiet {
+        return false;
+    }
+    let (mx, my) = (x - quiet, y - quiet);
+    mx < modules && my < modules && code[(mx, my)] == ModuleColor::Dark
+}
+
+/// Dots in a cell, Unicode order: 1 4 / 2 5 / 3 6 / 7 8.
+const BRAILLE_DOTS: [(usize, usize, u8); 8] = [
+    (0, 0, 0x01),
+    (1, 0, 0x08),
+    (0, 1, 0x02),
+    (1, 1, 0x10),
+    (0, 2, 0x04),
+    (1, 2, 0x20),
+    (0, 3, 0x40),
+    (1, 3, 0x80),
+];
+
+fn render_braille(code: &QrCode, quiet: usize) -> String {
+    let modules = code.width();
+    let side = modules + quiet * 2;
+    let cols = side.div_ceil(2);
+    let rows = side.div_ceil(4);
+    let mut out = String::with_capacity(rows * (cols + 1));
+    for row in 0..rows {
+        if row > 0 {
+            out.push('\n');
+        }
+        for col in 0..cols {
+            let mut bits = 0u8;
+            for (dx, dy, bit) in BRAILLE_DOTS {
+                if dark_at(code, modules, quiet, col * 2 + dx, row * 4 + dy) {
+                    bits |= bit;
+                }
+            }
+            out.push(char::from_u32(0x2800 + u32::from(bits)).expect("braille"));
+        }
+    }
+    out
+}
+
+/// `▀`/`▄`/`█`/space — one char per column, two modules per row, all
+/// rendered black on white so the caller can style the whole block at once.
+fn render_half_blocks(code: &QrCode, quiet: usize) -> String {
+    let modules = code.width();
+    let side = modules + quiet * 2;
+    let rows = side.div_ceil(2);
+    let mut out = String::with_capacity(rows * (side + 1));
+    for row in 0..rows {
+        if row > 0 {
+            out.push('\n');
+        }
+        for x in 0..side {
+            let top = dark_at(code, modules, quiet, x, row * 2);
+            let bottom = dark_at(code, modules, quiet, x, row * 2 + 1);
+            out.push(match (top, bottom) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            });
+        }
+    }
+    out
+}
+
+/// PNG QR for messengers and "show from the phone gallery" sharing: as
+/// close to `TARGET_QR_PNG` pixels as possible, never larger. The module
+/// count is fixed by the payload, so the size snaps to a whole-module scale.
+const TARGET_QR_PNG: u32 = 320;
+
 pub fn write_qr_png(data: &str, path: &Path) -> Result<(), ProfileError> {
+    use image::Luma;
     if data.is_empty() {
         return Err(ProfileError::Qr);
     }
     let code = QrCode::new(data.as_bytes()).map_err(|_| ProfileError::Qr)?;
+    let side = (code.width() + 8) as u32; // quiet zone 4 on each side
+    let module = (TARGET_QR_PNG / side).max(1);
     let image = code
         .render::<Luma<u8>>()
-        .min_dimensions(512, 512)
+        .module_dimensions(module, module)
         .quiet_zone(true)
         .build();
     image.save(path).map_err(|_| ProfileError::Io)
@@ -290,21 +385,56 @@ mod tests {
         assert_eq!(decode_profile(&url), Err(ProfileError::TooLarge));
     }
 
-    #[test]
-    fn terminal_qr_fits_a_short_string_and_skips_a_dense_one() {
-        let small = terminal_qr("hi", 80, 40).expect("short qr");
-        assert!(small.contains('▀') || small.contains('▄') || small.contains('█'));
-        let dense = format!("vpn://{}", "A".repeat(2048));
-        assert!(terminal_qr(&dense, 40, 20).is_none());
+    fn is_braille(text: &str) -> bool {
+        text.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c))
     }
 
     #[test]
-    fn write_qr_png_starts_with_the_png_magic() {
+    fn terminal_qr_blocks_uses_half_blocks_and_needs_a_wide_pane() {
+        let url = find_vpn_url(GOLDEN).unwrap();
+        let qr = terminal_qr_blocks(url, 240, 100).expect("golden vpn:// fits a wide pane");
+        let cols = qr.lines().next().unwrap().chars().count();
+        let rows = qr.lines().count();
+        assert!(cols <= 240 && rows <= 100, "{cols}×{rows}");
+        // One char per column, two modules per row: full-width lines and
+        // exactly ceil(side/2) rows.
+        assert!(qr.lines().all(|l| l.chars().count() == cols));
+        assert!(rows * 2 >= cols && rows * 2 <= cols + 1, "{cols}×{rows}");
+        assert!(
+            qr.chars().any(|c| ('\u{2580}'..='\u{259F}').contains(&c)),
+            "expected half-block glyphs:\n{qr}"
+        );
+        // A pane that fits braille is still too narrow for half blocks.
+        let braille = terminal_qr(url, 100, 40).expect("braille fits a small pane");
+        assert!(cols > braille.lines().next().unwrap().chars().count());
+        assert!(terminal_qr_blocks(url, 100, 40).is_none());
+    }
+
+    #[test]
+    fn terminal_qr_is_braille_and_a_real_profile_fits() {
+        let small = terminal_qr("hi", 80, 40).expect("short qr");
+        assert!(is_braille(&small), "{small}");
+        let url = find_vpn_url(GOLDEN).unwrap();
+        let qr = terminal_qr(url, 100, 40).expect("golden vpn:// fits 100×40");
+        let cols = qr.lines().next().unwrap().chars().count();
+        let rows = qr.lines().count();
+        assert!(cols <= 100 && rows <= 40, "{cols}×{rows}");
+        assert!(is_braille(&qr));
+        assert!(terminal_qr(&format!("vpn://{}", "A".repeat(4096)), 40, 20).is_none());
+    }
+
+    #[test]
+    fn write_qr_png_targets_320px_never_larger() {
         let path =
             std::env::temp_dir().join(format!("awg-mesh-tui-qr-{}-hi.png", std::process::id()));
-        write_qr_png("hi", &path).unwrap();
-        let bytes = std::fs::read(&path).unwrap();
+        let golden_url = find_vpn_url(GOLDEN).unwrap();
+        write_qr_png(golden_url, &path).unwrap();
+        use image::GenericImageView as _;
+        let img = image::open(&path).unwrap();
+        let (w, h) = img.dimensions();
         let _ = std::fs::remove_file(&path);
-        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(w <= TARGET_QR_PNG && h <= TARGET_QR_PNG, "{w}×{h}");
+        assert!(w > TARGET_QR_PNG / 2, "too small: {w}×{h}");
+        assert_eq!(w, h, "the QR must stay square");
     }
 }

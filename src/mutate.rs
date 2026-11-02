@@ -96,6 +96,32 @@ pub async fn peer_revoke(
     Ok(())
 }
 
+/// `…/bin/awg-mesh` → the checkout root where `peer add` writes
+/// `config/peers/<name>-exit.vpn` and leaves it until revoke.
+pub fn saved_exit_profile(cli_path: &str, name: &str) -> Result<String, MutateError> {
+    if !valid_name(name) {
+        return Err(MutateError::Failed(
+            "invalid peer name: lowercase letters, digits, dash, max 32".into(),
+        ));
+    }
+    let root = stack_root(cli_path).ok_or_else(|| {
+        MutateError::Failed("cli_path must be the checkout bin/awg-mesh script".into())
+    })?;
+    Ok(format!("{root}/config/peers/{name}-exit.vpn"))
+}
+
+fn stack_root(cli_path: &str) -> Option<&str> {
+    let (dir, file) = cli_path.rsplit_once('/')?;
+    if file != "awg-mesh" {
+        return None;
+    }
+    let (root, bin) = dir.rsplit_once('/')?;
+    if bin != "bin" || root.is_empty() {
+        return None;
+    }
+    Some(root)
+}
+
 /// Fetch a generated profile (.vpn) over ssh. `path` comes from the CLI
 /// response (server-generated, under the stack root).
 pub async fn fetch_profile(transport: &Transport, path: &str) -> Result<String, MutateError> {
@@ -181,5 +207,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(text, "vpn://deadbeef\n");
+    }
+
+    #[test]
+    fn saved_profile_path_follows_the_checkout_bin() {
+        assert_eq!(
+            saved_exit_profile("/root/amnezia-mesh/bin/awg-mesh", "phone").unwrap(),
+            "/root/amnezia-mesh/config/peers/phone-exit.vpn"
+        );
+        assert_eq!(
+            saved_exit_profile("$HOME/amnezia-mesh/bin/awg-mesh", "macbook-2").unwrap(),
+            "$HOME/amnezia-mesh/config/peers/macbook-2-exit.vpn"
+        );
+        assert!(saved_exit_profile("awg-mesh", "phone").is_err());
+        assert!(saved_exit_profile("/usr/local/bin/awg-mesh", "../x").is_err());
     }
 }

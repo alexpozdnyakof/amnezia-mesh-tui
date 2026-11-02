@@ -458,11 +458,13 @@ fn draw_hints(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 if app.read_only() {
                     " READ-ONLY · ↑↓ select · l logs · m map · Esc back "
                 } else {
-                    " ↑↓ select · a add · r rename · x revoke · c 14d · l logs · m map · Esc back "
+                    " ↑↓ select · a add · k key · r rename · x revoke · c 14d · l logs · m map · Esc back "
                 }
             }
             Screen::Map => " Esc back · auto-refresh 3s · l logs ",
-            Screen::Secret => " s save .vpn · p save QR · Esc close (secret cleared) ",
+            Screen::Secret => {
+                " s save .vpn · c copy link · p save QR png · Esc close (secret cleared) "
+            }
             Screen::Log => unreachable!(),
         };
         s.to_string()
@@ -1224,29 +1226,33 @@ fn draw_secret(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     let inner_w = area.width.saturating_sub(2);
     let inner_h = area.height.saturating_sub(2);
-    let qr_rows = inner_h.saturating_sub(lines.len() as u16 + 4);
+    // Leave one row under the code for the save hint.
+    let qr_rows = inner_h.saturating_sub(lines.len() as u16 + 2);
     let url = profile::find_vpn_url(&s.profile);
-    let qr = url.and_then(|u| profile::terminal_qr(u, inner_w, qr_rows));
+    // qrencode-style half blocks scan best; braille is the dense fallback.
+    let qr = url
+        .and_then(|u| profile::terminal_qr_blocks(u, inner_w, qr_rows))
+        .or_else(|| url.and_then(|u| profile::terminal_qr(u, inner_w, qr_rows)));
+    let qr_style = Style::default().fg(Color::Black).bg(Color::White);
     if let Some(qr) = &qr {
         lines.push(Line::from(""));
         for row in qr.lines() {
-            lines.push(Line::from(row.to_string()));
+            lines.push(Line::from(Span::styled(row.to_string(), qr_style)));
         }
     } else if url.is_some() {
         lines.push(Line::from(Span::styled(
-            "terminal QR is too dense for this pane — p saves a scannable PNG",
+            "QR does not fit this pane — make the terminal wider and taller, then press k again",
             WARN,
         )));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        " .vpn profile — import in the Amnezia app:",
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
-    let budget = (inner_h as usize).saturating_sub(lines.len());
-    for l in s.profile.lines().take(budget) {
-        lines.push(Line::from(Span::styled(l.to_string(), GOOD)));
+    if let Some(url) = url {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "vpn:// link — c copies it:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(url.to_string(), GOOD)));
     }
     if let Some(p) = &s.saved_to {
         lines.push(Line::from(Span::styled(format!("saved: {p}"), GOOD)));
@@ -1255,14 +1261,26 @@ fn draw_secret(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         lines.push(Line::from(Span::styled(format!("qr: {p}"), GOOD)));
     }
     if let Some(err) = &s.qr_error {
-        lines.push(Line::from(Span::styled(err.clone(), BAD)));
+        lines.push(Line::from(Span::styled(format!("qr: {err}"), BAD)));
+    }
+    if let Some(err) = &s.copy_error {
+        lines.push(Line::from(Span::styled(format!("copy: {err}"), BAD)));
+    } else if s.copied {
+        lines.push(Line::from(Span::styled(
+            "vpn:// link copied to clipboard",
+            GOOD,
+        )));
     }
     let body = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" new peer — shown once · {} ", s.name)),
-        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " {} · {} ",
+            if s.fresh {
+                "new peer — shown once"
+            } else {
+                "saved key — k reopens"
+            },
+            s.name
+        )))
         .wrap(Wrap { trim: false });
     f.render_widget(body, area);
 }
@@ -1600,7 +1618,15 @@ mod tests {
         assert!(view.contains("100.64.0.7"), "{view}");
         assert!(view.contains("100.64.0.1"), "{view}");
         assert!(!view.contains("SECRETKEY"), "{view}");
-        assert!(view.contains("p save QR"), "{view}");
+        assert!(view.contains("vpn:// link — c copies it:"), "{view}");
+        assert!(view.contains("vpn://AAA"), "{view}");
+        assert!(view.contains("c copy link"), "{view}");
+        assert!(view.contains("p save QR png"), "{view}");
+        assert!(
+            view.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
+            "expected a braille QR in the secret screen:\n{view}"
+        );
+        assert!(!view.contains("PNG"), "{view}");
     }
 
     fn coast_cells(x: [f64; 2], y: [f64; 2]) -> usize {

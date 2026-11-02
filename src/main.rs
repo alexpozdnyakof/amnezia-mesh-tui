@@ -573,6 +573,7 @@ async fn handle_key(app: &Arc<Mutex<App>>, key: KeyEvent) -> bool {
                         }
                     }
                     KeyCode::Char('a') => a.open_add_input(),
+                    KeyCode::Char('k') => a.show_saved_key(),
                     KeyCode::Char('r') => a.open_rename_input(),
                     KeyCode::Char('x') | KeyCode::Delete => a.request_revoke(),
                     KeyCode::Char('c') => a.revoke_candidate_key(),
@@ -584,6 +585,7 @@ async fn handle_key(app: &Arc<Mutex<App>>, key: KeyEvent) -> bool {
         }
         Screen::Secret => match key.code {
             KeyCode::Char('s') => a.save_secret_vpn(),
+            KeyCode::Char('c') => a.copy_secret_link(),
             KeyCode::Char('p') => a.save_secret_qr(),
             KeyCode::Esc => a.close_secret(),
             _ => {}
