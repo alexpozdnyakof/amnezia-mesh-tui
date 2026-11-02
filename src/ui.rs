@@ -2,7 +2,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
+use ratatui::widgets::canvas::{Canvas, Line as CanvasLine, Map, MapResolution};
 use ratatui::widgets::{
     Axis, Block, Borders, Cell, Chart, Dataset, GraphType, List, ListItem, ListState, Paragraph,
     Row, Table, Wrap,
@@ -17,7 +17,7 @@ use crate::chart::{
 };
 use crate::docker::ContainerInfo;
 use crate::doctor::DoctorCheck;
-use crate::geo::{centroid, fit_bounds, geo_label, GeoInfo};
+use crate::geo::{centroid, geo_label, GeoInfo};
 use crate::logs::STATS_LOG_PATH;
 use crate::peers::{
     format_age, format_bytes, format_rate, short_pubkey, PeerStatus, ResolvedPeer, REVOKE_AFTER,
@@ -1136,38 +1136,18 @@ fn draw_map(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         return;
     }
     let hub = hub.expect("checked above");
-    let mut all = known.clone();
-    all.push(hub);
-    let ((lat_min, lat_max), (lon_min, lon_max)) = fit_bounds(&all).expect("non-empty");
+    // Whole world. A window fitted to the peers is only a few degrees wide,
+    // and the coastline set then lands almost no points on the canvas.
     let canvas = Canvas::default()
         .marker(symbols::Marker::Braille)
-        .x_bounds([lon_min, lon_max])
-        .y_bounds([lat_min, lat_max])
+        .x_bounds([-180.0, 180.0])
+        .y_bounds([-90.0, 90.0])
         .paint(move |ctx| {
-            // 10° grid for orientation (equirectangular, distortion at
-            // high latitudes is acceptable for an admin overview)
-            let mut lon = (lon_min / 10.0).ceil() * 10.0;
-            while lon <= lon_max {
-                ctx.draw(&CanvasLine {
-                    x1: lon,
-                    y1: lat_min,
-                    x2: lon,
-                    y2: lat_max,
-                    color: Color::Rgb(30, 40, 30),
-                });
-                lon += 10.0;
-            }
-            let mut lat = (lat_min / 10.0).ceil() * 10.0;
-            while lat <= lat_max {
-                ctx.draw(&CanvasLine {
-                    x1: lon_min,
-                    y1: lat,
-                    x2: lon_max,
-                    y2: lat,
-                    color: Color::Rgb(30, 40, 30),
-                });
-                lat += 10.0;
-            }
+            ctx.draw(&Map {
+                resolution: MapResolution::High,
+                color: Color::Green,
+            });
+            ctx.layer();
             for (_, info) in &peers_with_geo {
                 ctx.draw(&CanvasLine {
                     x1: hub.1,
@@ -1198,7 +1178,7 @@ fn draw_map(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" connection map · hub-and-spoke "),
+                .title(" connection map · coasts · hub-and-spoke "),
         );
     f.render_widget(canvas, chunks[0]);
 }
@@ -1621,5 +1601,49 @@ mod tests {
         assert!(view.contains("100.64.0.1"), "{view}");
         assert!(!view.contains("SECRETKEY"), "{view}");
         assert!(view.contains("p save QR"), "{view}");
+    }
+
+    fn coast_cells(x: [f64; 2], y: [f64; 2]) -> usize {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| {
+            let canvas = Canvas::default()
+                .marker(symbols::Marker::Braille)
+                .x_bounds(x)
+                .y_bounds(y)
+                .paint(|ctx| {
+                    ctx.draw(&Map {
+                        resolution: MapResolution::High,
+                        color: Color::Green,
+                    });
+                });
+            f.render_widget(canvas, f.area());
+        })
+        .expect("draw");
+        let buf = term.backend().buffer();
+        let mut n = 0;
+        for row in 0..buf.area.height {
+            for col in 0..buf.area.width {
+                let braille = buf[(col, row)]
+                    .symbol()
+                    .chars()
+                    .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c));
+                if braille {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn world_bounds_show_a_coast_and_a_city_zoom_does_not() {
+        let world = coast_cells([-180.0, 180.0], [-90.0, 90.0]);
+        let city = coast_cells([-1.0, 10.0], [47.0, 57.0]);
+        assert!(world > 80, "world coast cells {world}");
+        assert!(
+            world > city * 2,
+            "world coast cells {world}, city zoom {city}"
+        );
     }
 }

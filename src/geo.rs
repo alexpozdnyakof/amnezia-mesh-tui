@@ -90,7 +90,8 @@ pub fn geo_label(g: &GeoInfo) -> String {
 
 /// Lat/lon bounds for the map canvas: 15% margin, degenerate spans
 /// expanded to ±5° so a single point does not collapse the projection.
-pub fn fit_bounds(points: &[(f64, f64)]) -> Option<((f64, f64), (f64, f64))> {
+#[cfg(test)]
+fn fit_bounds(points: &[(f64, f64)]) -> Option<((f64, f64), (f64, f64))> {
     if points.is_empty() {
         return None;
     }
